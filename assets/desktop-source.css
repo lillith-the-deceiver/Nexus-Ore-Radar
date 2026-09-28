@@ -1,0 +1,47 @@
+
+    * { box-sizing: border-box; }
+    body {
+      font-family: 'Rajdhani', sans-serif;
+      background-color: #030712;
+      color: #f8fafc;
+    }
+    .font-orbitron { font-family: 'Orbitron', sans-serif; }
+    .font-mono { font-family: 'JetBrains Mono', monospace; }
+    ::-webkit-scrollbar { width: 7px; height: 7px; }
+    ::-webkit-scrollbar-track { background: #060b18; }
+    ::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: #334155; }
+    #operations-panel { align-self: start; }
+    #radar-layout { display:flex; flex-direction:column; align-items:stretch; }
+    #operations-panel { align-self:stretch; }
+    #search-controls .data-action-buttons { align-items:flex-start; }
+    #scan, #cancel-scan { height:40px;white-space:nowrap; }
+    #data-controls { display:grid;grid-template-columns:minmax(0,1fr) auto auto auto;gap:8px;align-items:center; }
+    #data-radius-label { grid-column:1;grid-row:1; }
+    #data-radius-field { grid-column:1;grid-row:2;height:40px; }
+    #data-controls #scan { grid-column:2;grid-row:2; }
+    #data-controls #cancel-scan { grid-column:4;grid-row:2; }
+    .analytics-list { max-height: 11.5rem; overflow-y: auto; }
+    #analytics-by-resource { grid-template-columns: repeat(auto-fit, minmax(min(100%, 27rem), 1fr)); }
+    #analytics-yield-history { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+    #analytics-yield-history[hidden] { display:none; }
+    .yield-history-panel { min-width:0; background:#070e20; border:1px solid #2b384d; border-radius:12px; padding:13px; }
+    .yield-history-panel svg { width:100%; height:170px; display:block; }
+    .yield-history-panel svg text { fill:#94abc5; font:11px 'JetBrains Mono',monospace; }
+    .yield-history-panel .history-heading { display:flex; justify-content:space-between; gap:8px; font-size:14px; font-weight:700; }
+    @media(max-width:620px) { #analytics-yield-history { grid-template-columns:1fr; } }
+    #yield-tables { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 26rem), 1fr)); gap: 12px; }
+    .fuel-row { display: grid; grid-template-columns: minmax(0,1.35fr) minmax(0,1fr) minmax(0,1fr) minmax(0,.4fr); gap: 10px; align-items: center; }
+    #yield-tables { grid-template-columns: repeat(2,minmax(0,1fr)); align-items: start; }
+    #yield-tables summary { list-style: none; }
+    #yield-tables summary::-webkit-details-marker { display: none; }
+    .fuel-chevron::before { content: '› '; color: #38bdf8; }
+    .belt-numbers { display:flex; align-items:center; gap:12px; white-space:nowrap; margin-left:auto; }
+    .belt-percent { min-width:6ch; text-align:right; }
+    .matched-header { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:start; gap:8px; }
+    .matched-distance { min-width:7ch; text-align:right; white-space:nowrap; }
+    #results-panel.results-collapsed { min-height:0; }
+    #results-panel.results-collapsed #belts-container { display:none; }
+    details[open] .fuel-chevron::before { content: '⌄ '; }
+    @media (max-width:650px) { #yield-tables { grid-template-columns: 1fr; } }
+  

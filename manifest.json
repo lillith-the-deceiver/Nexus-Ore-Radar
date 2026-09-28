@@ -1,0 +1,46 @@
+{
+  "manifest_version": 3,
+  "name": "Nexus Ore Radar",
+  "version": "0.2.5",
+  "description": "Find mining belts and track mining results. Requires sharing Season 0 mining pirate-raid reports.",
+  "permissions": [
+    "storage",
+    "alarms",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://s0.nexuslegacy.space/*",
+    "https://nf.nexuslegacy.space/*",
+    "https://beta.nexuslegacy.space/*",
+    "https://script.google.com/*",
+    "https://script.googleusercontent.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "icons": {
+    "128": "assets/app_icon_128.png"
+  },
+  "action": {
+    "default_title": "Open Nexus Radar",
+    "default_icon": {
+      "128": "assets/app_icon_128.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.nexuslegacy.space/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'none'"
+  },
+  "minimum_chrome_version": "120"
+}
