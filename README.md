@@ -4,7 +4,7 @@ Chrome extension for Nexus Legacy that mirrors the released Nexus Ore Radar func
 
 ## Install from GitHub
 
-1. Download [`Nexus-Ore-Radar-0.2.5-release.zip`](downloads/Nexus-Ore-Radar-0.2.5-release.zip?raw=1).
+1. Download [`Nexus-Ore-Radar-0.2.6-release.zip`](downloads/Nexus-Ore-Radar-0.2.6-release.zip?raw=1).
 2. Extract the ZIP to a permanent folder.
 3. Open `chrome://extensions` in Chrome.
 4. Enable **Developer mode**.
@@ -21,4 +21,4 @@ See [PRIVACY_POLICY.md](PRIVACY_POLICY.md) for the complete data-use, retention 
 
 ## Current version
 
-`0.2.5`
+`0.2.6`

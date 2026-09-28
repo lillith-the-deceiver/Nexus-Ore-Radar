@@ -37,11 +37,11 @@ const prefKey=()=>`ui:${currentContext}`;
 $('search-body').innerHTML=desktopSearch;
 document.body.insertAdjacentHTML('beforeend',desktopLocations);
 let preferences={},mapSystems=[],searchFilter={type:'all',zone:'all',richness:1.0001,remaining:100};
-let originsLoadedContext='',nextOriginsAttempt=0;
+let originsLoadedContext='',originsRefreshAttemptedContext='',nextOriginsAttempt=0;
 async function savePreferences(){await chrome.storage.local.set({[prefKey()]:{...preferences,filter:searchFilter,customRichness:$('custom-richness').value||'',radius:$('radius').value,origin:$('search-origin').value}});}
 function restoreHidden(){document.querySelectorAll('[data-hide]').forEach(b=>{const hidden=!!preferences.hidden?.[b.dataset.hide];$(b.dataset.hide).hidden=hidden;b.textContent=hidden?'Show':'Hide';b.setAttribute('aria-expanded',String(!hidden));});}
 function renderOrigins(){const selected=$('search-origin').value||preferences.origin;const options=(preferences.locations||[]).map(l=>new Option(locationOptionLabel(l),String(l.id)));$('search-origin').replaceChildren(...(options.length?options:[new Option('Add a saved location to calculate proximity','')]));$('search-origin').value=options.some(o=>o.value===selected)?selected:(options[0]?.value||'');preferences.origin=$('search-origin').value;}
-async function loadOrigins(){const context=currentContext;const data=await request({type:'LOAD_MAP',refresh:true});if(context!==currentContext)return;mapSystems=data.systems;preferences.locations=syncPlanetLocations(preferences.locations||[],data.planets,data.systems);if(data.refreshError)$('error').textContent=data.refreshError;renderOrigins();await savePreferences();if(context!==currentContext)return;originsLoadedContext=context;nextOriginsAttempt=0;renderScanControls();renderSearch(true);}
+async function loadOrigins(){const context=currentContext,refresh=originsRefreshAttemptedContext!==context;originsRefreshAttemptedContext=context;const data=await request({type:'LOAD_MAP',refresh});if(context!==currentContext)return;mapSystems=data.systems;preferences.locations=syncPlanetLocations(preferences.locations||[],data.planets,data.systems);if(data.refreshError)$('error').textContent=data.refreshError;renderOrigins();await savePreferences();if(context!==currentContext)return;originsLoadedContext=context;nextOriginsAttempt=0;renderScanControls();renderSearch(true);}
 function locationMessage(text='',isError=false){const message=$('locations-message');message.textContent=text;message.className=`text-xs font-bold ${text?'':'hidden'} ${isError?'text-rose-400':'text-emerald-400'}`;}
 async function saveLocationRows(rows,origin=$('search-origin').value){
   const context=currentContext;
@@ -96,7 +96,7 @@ async function refresh() {
     $('analytics-loading-state').classList.toggle('text-rose-300',status?.state==='error');
     if(currentContext!==connection.context){
       currentContext=connection.context;lastReportStamp=0;records=[];missions=[];fuelQuotes=[];geometry={};lastScanSignature='';lastRecordsSignature='';
-      cachedBelts=[];mapSystems=[];lastBeltsStamp='';exactUpdatedAt=0;originsLoadedContext='';nextOriginsAttempt=0;
+      cachedBelts=[];mapSystems=[];lastBeltsStamp='';exactUpdatedAt=0;originsLoadedContext='';originsRefreshAttemptedContext='';nextOriginsAttempt=0;
       preferences=(await chrome.storage.local.get(prefKey()))[prefKey()]||{};sent=preferences.sent||{};
       searchFilter=preferences.filter||{type:'all',zone:'all',richness:1.0001,remaining:100};
       $('custom-richness').value=preferences.customRichness||'';$('radius').value=preferences.radius||350;

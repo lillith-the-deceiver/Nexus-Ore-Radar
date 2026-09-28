@@ -44,10 +44,7 @@ async function reportsSinceFirstUse(context,feeds){
   await chrome.storage.local.set({[key]:result.baseline});
   return result.feeds;
 }
-async function storedMapFor(context){
- const saved=(await chrome.storage.session.get('mapData')).mapData;
- return saved?.context===context?saved:await mapDataFor(context);
-}
+const storedMapFor=context=>mapDataFor(context);
 async function loadMapFor(c,force=false){
   const previous=await mapDataFor(c.context);
   let result={data:previous,refreshed:false,planetsRefreshed:false};
@@ -58,14 +55,14 @@ async function loadMapFor(c,force=false){
     result.data={...result.data,context:c.context};
     if(result.refreshed){await saveMapData(c.context,result.data,result.markers);await beltsChanged(c.context);}
   }
-  await chrome.storage.session.set({mapData:result.data,mapRefreshContext:null});await analyticsChanged(c.context);
+  await chrome.storage.session.set({mapRefreshContext:null});await analyticsChanged(c.context);
   return result;
 }
 async function matchingTabs(origin) {
   const tabs=await chrome.tabs.query({url:origin+'/*'});
   return tabs.filter(t=>t.id!==undefined);
 }
-async function read(tabId,origin,path,priority=false,validate) {
+async function read(tabId,origin,path,priority=false,validate,trackScanIdentity=true) {
   await pacing.wait(priority);
   if(validate)await validate();
   const result=await sendRead(tabId,origin,path);
@@ -73,10 +70,37 @@ async function read(tabId,origin,path,priority=false,validate) {
     const status=result?.status || 0;
     throw Object.assign(Error(status===401 || status===403 ? 'Sign into the selected season in Nexus, then reconnect.' : `Nexus request unavailable (${status}).`),{status});
   }
-  if(path==='/api/auth/me'&&activeScan&&JSON.parse(activeScan.context)[0]===origin&&result.data?.user?.id!=null&&contextKey(origin,result.data.user.id)!==activeScan.context){
+  if(trackScanIdentity&&path==='/api/auth/me'&&activeScan&&JSON.parse(activeScan.context)[0]===origin&&result.data?.user?.id!=null&&contextKey(origin,result.data.user.id)!==activeScan.context){
     activeScan.contextChanged=true;activeScan.error='Account changed. Reconnect before searching.';
   }
   return result.data;
+}
+async function authenticatedTab(origin,expectedContext=null,preferredTabId=null,validate){
+  const tabs=await matchingTabs(origin);
+  if(!tabs.length)throw Error('Open the selected season in Nexus.');
+  const ordered=preferredTabId==null?tabs:[...tabs].sort((a,b)=>Number(b.id===preferredTabId)-Number(a.id===preferredTabId));
+  let lastError;
+  for(const tab of ordered){
+    try{
+      const identity=await read(tab.id,origin,'/api/auth/me',true,validate,false);
+      const context=contextKey(origin,identity?.user?.id);
+      if(expectedContext&&context!==expectedContext)continue;
+      return {tab,identity,context};
+    }catch(error){lastError=error;}
+  }
+  if(expectedContext)throw Object.assign(Error('Open the selected account and season in Nexus, then reconnect.'),{status:409,contextChanged:true});
+  throw lastError||Error('Sign into the selected season in Nexus, then reconnect.');
+}
+async function establishConnection(origin,force=false){
+  const selected=await authenticatedTab(origin);
+  const {tab,identity,context}=selected;
+  const current=await getSettings();
+  if(!hasConsent(current)||!current.enabled||current.origin!==origin)throw Error('Account, season or connection changed.');
+  await reportsSinceFirstUse(context,[]);
+  const connection={origin,context,tabId:tab.id,username:identity.user.username||'Nexus player'};
+  await chrome.storage.session.set({connection,status:{...connection,state:'connected',at:Date.now(),message:`Connected to ${SEASONS.find(s=>s.origin===origin).name}. Capturing reports…`}});
+  void syncMissions(tab,origin,context,force);
+  return selected;
 }
 async function sync(force=false) {
   await lifecycleReady;
@@ -87,15 +111,10 @@ async function sync(force=false) {
     const settings=await getSettings();
     if(!hasConsent(settings) || !settings.origin || !settings.enabled) return;
     lastAttempt=Date.now();
-    const origin=seasonOrigin(settings.origin), tabs=await matchingTabs(origin);
-    if(!tabs.length) {await setStatus({state:'waiting',message:'Open Nexus in the selected season to capture reports.'});return;}
-    const tab=tabs[0];
-    const identity=await read(tab.id,origin,'/api/auth/me',true);
+    const origin=seasonOrigin(settings.origin);
+    if(!(await matchingTabs(origin)).length) {await setStatus({state:'waiting',message:'Open Nexus in the selected season to capture reports.'});return;}
+    const {tab,identity,context}=await establishConnection(origin,force);
     const userId=identity?.user?.id;
-    const context=contextKey(origin,userId);
-    // Like the personal mission worker, start independently of report ingestion.
-    // This authenticated identity is checked again before any mission is saved.
-    void syncMissions(tab,origin,context,force);
     const {feeds,errors}=await readReportFeeds(path=>read(tab.id,origin,path,false));
     // Detect a changed account before attributing the response to it.
     const check=await read(tab.id,origin,'/api/auth/me',true);
@@ -110,8 +129,7 @@ async function sync(force=false) {
     const capturedCounts=await counts(context);
     const latest=await getSettings();
     if(!hasConsent(latest)||!latest.enabled||latest.origin!==origin)return;
-    const connection={origin,context,username:identity.user.username || 'Nexus player'};
-    // Publish the dashboard gate and status together, never a success label alone.
+    const connection={origin,context,tabId:tab.id,username:identity.user.username || 'Nexus player'};
     await chrome.storage.session.set({connection,status:{...connection,state:errors.length?'error':'connected',at:Date.now(),
       message:errors.length?errors.join('; '):`Connected to ${SEASONS.find(s=>s.origin===origin).name}.`,reportErrors:errors,...capturedCounts}});
     // Independent network task: a slow Drive receiver must not delay Nexus polling.
@@ -166,8 +184,7 @@ async function pollOperations(force=false){
   try{
     const settings=await getSettings(),c=(await chrome.storage.session.get('connection')).connection;
     if(hasConsent(settings)&&settings.enabled&&c?.origin===settings.origin){
-      const tabs=await matchingTabs(c.origin);
-      if(tabs.length){void syncMissions(tabs[0],c.origin,c.context,force);const missions=missionSnapshots.get(c.context);if(missions)void syncQuote(tabs[0],c.origin,c.context,missions);}
+      try{const {tab}=await authenticatedTab(c.origin,c.context,c.tabId);void syncMissions(tab,c.origin,c.context,force);const missions=missionSnapshots.get(c.context);if(missions)void syncQuote(tab,c.origin,c.context,missions);}catch{}
     }
   }finally{await reports;}
 }
@@ -186,14 +203,12 @@ async function searchRead(c,path,verifyIdentity=true) {
     if((await activeContext()).context!==c.context)throw Object.assign(Error('Account or season changed.'),{status:409,contextChanged:true});
   };
   await validate();
-  const tabs=await matchingTabs(c.origin);if(!tabs.length)throw Error('Open the selected season in Nexus.');
-  // Establish identity at the operation boundary, not before every detail.
-  // The authenticated report/mission lanes keep checking it during a scan.
-  if(verifyIdentity){
-    const me=await read(tabs[0].id,c.origin,'/api/auth/me',false,validate);
-    if(contextKey(c.origin,me?.user?.id)!==c.context)throw Object.assign(Error('Account changed. Reconnect before searching.'),{status:409,contextChanged:true});
+  let tab=(await matchingTabs(c.origin)).find(candidate=>candidate.id===c.tabId);
+  if(verifyIdentity||!tab){
+    const selected=await authenticatedTab(c.origin,c.context,c.tabId,validate);tab=selected.tab;
+    if(c.tabId!==tab.id){c.tabId=tab.id;await chrome.storage.session.set({connection:c});}
   }
-  return read(tabs[0].id,c.origin,path,false,validate);
+  return read(tab.id,c.origin,path,false,validate);
 }
 async function runScan(job,c){
   const started=performance.now();
@@ -273,9 +288,10 @@ chrome.runtime.onMessage.addListener((msg,sender,respond)=>{
     if(msg.type==='CONNECT') {
       const s=await getSettings();if(!hasConsent(s))throw Error('Agreement required.');
       if(activeScan&&JSON.parse(activeScan.context)[0]!==seasonOrigin(msg.origin))activeScan.contextChanged=true;
-      s.origin=seasonOrigin(msg.origin);s.enabled=true;await putSettings(s);await setStatus({state:'connecting',message:'Connecting to selected season…'});await sync(true);
-      const connected=(await chrome.storage.session.get('connection')).connection;
-      if(connected?.origin===s.origin)await chrome.storage.session.set({mapRefreshContext:connected.context});return {ok:true};
+      s.origin=seasonOrigin(msg.origin);s.enabled=true;await putSettings(s);await setStatus({state:'connecting',message:'Connecting to selected season…'});
+      if(!(await matchingTabs(s.origin)).length){await setStatus({state:'waiting',message:'Open Nexus in the selected season to capture reports.'});return {ok:true};}
+      try{const connected=await establishConnection(s.origin,true);await chrome.storage.session.set({mapRefreshContext:connected.context});void sync(true);return {ok:true};}
+      catch(error){await setStatus({state:'error',message:error.message||'Connection failed.'});throw error;}
     }
     if(msg.type==='SYNC') {await pollOperations(true);return {ok:true};}
     if(msg.type==='REPORTS'){const c=await activeContext(),saved=await storedMapFor(c.context);return {context:c.context,reports:await reportsFor(c.context),missions:await missionsFor(c.context),fuelQuotes:await fuelQuotesFor(c.context),geometry:saved?.context===c.context?{systems:list(saved.map,'systems'),planets:list(saved.planets,'planets')}:{systems:[],planets:[]}};}
@@ -301,12 +317,11 @@ chrome.runtime.onMessage.addListener((msg,sender,respond)=>{
       if(searchBusy||activeScan)throw Error('Search request already running.');searchBusy=true;
       try{const c=await activeContext();let saved=await storedMapFor(c.context);
         if(!saved)saved=(await loadMapFor(c,true)).data;
-        await chrome.storage.session.set({mapData:saved});
         const index=await searchRead(c,'/api/galaxy/field-index');
         await saveFieldIndex(c.context,list(index,'systems'));
         const queue=candidates(saved.map,index,msg.originId,Number(msg.radius),{examples:await searchExamplesFor(c.context),sent:await manualMarkers.get(c.context)});
         const updatedMap={...saved,map:indexSystems(list(saved.map,'systems'),normalizedFieldIndex(index))};
-        await saveMapData(c.context,updatedMap);await chrome.storage.session.set({mapData:updatedMap});
+        await saveMapData(c.context,updatedMap);
         await clearExactBeltCache(c.context);
         await beltsChanged(c.context);
         const job={id:crypto.randomUUID(),context:c.context,queue,done:0,running:queue.length>0,startedAt:Date.now()};
