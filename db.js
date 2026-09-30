@@ -9,6 +9,12 @@ import {retainedMissionSnapshot,missionForAnalytics} from './missions.js';
 import {exactOperationLink,reportOperationLink,joinedReport,pendingReportRelinks,missionReportRelinks} from './report-links.js';
 let opening;
 const DATABASE_NAME='nexus-radar-community-v1';
+export async function metadataFor(context,kind){
+ const db=await database();return new Promise((resolve,reject)=>{const q=db.transaction('metadata','readonly').objectStore('metadata').get(JSON.stringify([context,kind]));q.onsuccess=()=>resolve(q.result?.value??null);q.onerror=()=>reject(q.error);});
+}
+export async function saveMetadata(context,kind,value){
+ const db=await database();return new Promise((resolve,reject)=>{const tx=db.transaction('metadata','readwrite');tx.objectStore('metadata').put({key:JSON.stringify([context,kind]),context,kind,value});tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error);tx.onabort=()=>reject(tx.error||Error('Could not save Radar data'));});
+}
 export async function mapDataFor(context){
  const db=await database();return new Promise((resolve,reject)=>{
   const q=db.transaction('metadata','readonly').objectStore('metadata').get(JSON.stringify([context,'galaxy-map']));

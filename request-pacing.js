@@ -1,11 +1,11 @@
 // Port of server.py's adaptive request pacing. Times are milliseconds here.
 export class RequestPacing {
   constructor({now=()=>performance.now(),sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms)),delayMs=500}={}){
-    this.now=now;this.sleep=sleep;this.configured=Math.max(500,Math.min(Number(delayMs)||500,3000));
+    this.now=now;this.sleep=sleep;this.configured=Math.max(250,Math.min(Number(delayMs)||500,3000));
     this.backoffUntil=0;this.normal=[];this.priority=[];this.reset();
   }
   reset(){this.last=0;this.delay=this.configured;this.streak=0;this.holdUntil=0;}
-  success(){if(this.now()<this.holdUntil)return;if(++this.streak>=10){this.delay=Math.max(400,this.delay-25);this.streak=0;}}
+  success(){if(this.now()<this.holdUntil)return;if(++this.streak>=10){this.delay=Math.max(250,this.delay-25);this.streak=0;}}
   backoff(attempt,rateLimited=false){
     const pause=Math.min(60000,5000*2**Math.max(0,Math.trunc(attempt))),now=this.now();
     this.backoffUntil=Math.max(this.backoffUntil,now+pause);this.streak=0;

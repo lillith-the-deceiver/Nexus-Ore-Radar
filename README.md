@@ -1,10 +1,10 @@
 # Nexus Ore Radar
 
-Chrome extension for Nexus Legacy that mirrors the released Nexus Ore Radar functionality: mining-belt search, saved origins, mining analytics, mission context and report capture.
+Chrome extension for Nexus Legacy with mining-belt search, saved origins, mining analytics, fleet presets, destination optimization, mission context and report capture.
 
 ## Install from GitHub
 
-1. Download [`Nexus-Ore-Radar-0.2.6-release.zip`](downloads/Nexus-Ore-Radar-0.2.6-release.zip?raw=1).
+1. Download [`Nexus-Ore-Radar-0.2.7-release.zip`](downloads/Nexus-Ore-Radar-0.2.7-release.zip?raw=1).
 2. Extract the ZIP to a permanent folder.
 3. Open `chrome://extensions` in Chrome.
 4. Enable **Developer mode**.
@@ -19,6 +19,8 @@ Using Nexus Ore Radar requires accepting the in-extension data notice. Eligible 
 
 See [PRIVACY_POLICY.md](PRIVACY_POLICY.md) for the complete data-use, retention and removal information.
 
+See [CHANGELOG.md](CHANGELOG.md) for release changes.
+
 ## Current version
 
-`0.2.6`
+`0.2.7`

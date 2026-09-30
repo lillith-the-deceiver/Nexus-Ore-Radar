@@ -20,6 +20,8 @@ import {exactUpdateLabel} from './belt-cache.js';
 import {sectionRenderer} from './analytics-sections.js';
 import {showToast,copySystemName,analyticsSyncLabel} from './desktop-feedback.js';
 import {resourceTotals} from './resource-totals.js';
+import {createDestinationControls} from './destination-controls.js';
+import {breakdownRatesWithBaseline} from './destination-estimates.js';
 const loadedVersion=chrome.runtime.getManifest().version;
 const $=id=>document.getElementById(id),fmt=n=>n===null||n===undefined?'—':Math.round(n).toLocaleString();
 const request=async message=>{const r=await chrome.runtime.sendMessage(message);if(r?.error)throw Error(r.error);return r;};
@@ -31,11 +33,13 @@ let scanStarting=false,scanStopping=false;
 let nextBeltReadAt=0,lastBeltScanId='';
 let progressFailures=0,progressRetryAt=0;
 let exactUpdatedAt=0;
+let analyticsCache=new Map(),searchRenderGeneration=0;
 const renderSection=sectionRenderer();
 const prefKey=()=>`ui:${currentContext}`;
 // Static, source-extracted desktop markup. Game data is never inserted as HTML.
 $('search-body').innerHTML=desktopSearch;
 document.body.insertAdjacentHTML('beforeend',desktopLocations);
+const destinationControls=createDestinationControls({request,resource:'all',reload:()=>renderSearch(true)});
 let preferences={},mapSystems=[],searchFilter={type:'all',zone:'all',richness:1.0001,remaining:100};
 let originsLoadedContext='',originsRefreshAttemptedContext='',nextOriginsAttempt=0;
 async function savePreferences(){await chrome.storage.local.set({[prefKey()]:{...preferences,filter:searchFilter,customRichness:$('custom-richness').value||'',radius:$('radius').value,origin:$('search-origin').value}});}
@@ -77,7 +81,7 @@ async function refresh() {
     }
     if(dashboardUpdateNeeded(state,loadedVersion)){location.reload();return;}
     if(!compatibleState(state)){
-      $('workspace').hidden=false;$('season-panel').hidden=false;$('radar').hidden=true;$('change-season').hidden=true;
+      $('workspace').hidden=false;$('season-panel').hidden=false;$('radar').hidden=true;$('change-season').hidden=true;$('destination-fleet-toggle').hidden=true;
       $('connection-badge').textContent='Extension reload required';$('connection').textContent=RELOAD_MESSAGE;$('connect').disabled=true;
       return;
     }
@@ -88,20 +92,22 @@ async function refresh() {
     if(!known&&!$('agreement').open)$('agreement').showModal();
     const sig=JSON.stringify(seasons);if(sig!==previousSeasons){previousSeasons=sig;const selected=$('seasons').value||settings.origin||seasons[0]?.origin;$('seasons').replaceChildren(...seasons.map(s=>new Option(s.name,s.origin)));$('seasons').value=selected;}
     const connected=connectedState(settings,connection,accepted);
-    $('radar').hidden=!connected;$('change-season').hidden=!connected;$('season-panel').hidden=connected&&!showSeason;
+    $('radar').hidden=!connected;$('change-season').hidden=!connected;$('season-panel').hidden=connected&&!showSeason;$('destination-fleet-toggle').hidden=!connected||showSeason;
     $('connection').textContent=status?.message||'Choose a season.';
     $('connection-badge').textContent=connected?`${seasons.find(s=>s.origin===connection.origin)?.name} · ${status?.state==='connected'?'Connected':status?.state==='waiting'?'Waiting for game':'Connection needs attention'}`:'Not connected';
     if(!connected)return;
     $('analytics-loading-state').textContent=analyticsSyncLabel(status);
     $('analytics-loading-state').classList.toggle('text-rose-300',status?.state==='error');
     if(currentContext!==connection.context){
-      currentContext=connection.context;lastReportStamp=0;records=[];missions=[];fuelQuotes=[];geometry={};lastScanSignature='';lastRecordsSignature='';
+      currentContext=connection.context;lastReportStamp=0;records=[];missions=[];fuelQuotes=[];geometry={};lastScanSignature='';lastRecordsSignature='';analyticsCache=new Map();
       cachedBelts=[];mapSystems=[];lastBeltsStamp='';exactUpdatedAt=0;originsLoadedContext='';originsRefreshAttemptedContext='';nextOriginsAttempt=0;
       preferences=(await chrome.storage.local.get(prefKey()))[prefKey()]||{};sent=preferences.sent||{};
       searchFilter=preferences.filter||{type:'all',zone:'all',richness:1.0001,remaining:100};
+      destinationControls.selectResource(searchFilter.type);
       $('custom-richness').value=preferences.customRichness||'';$('radius').value=preferences.radius||350;
       $('search-origin').value='';renderOrigins();renderAnalytics();
       restoreHidden();updateFilterButtons();showSeason=false;
+      await destinationControls.setContext(currentContext);
     }
     if(originsLoadedContext!==currentContext&&Date.now()>=nextOriginsAttempt){
       nextOriginsAttempt=Date.now()+3000;
@@ -125,7 +131,7 @@ async function refreshAnalyticsData(stamp){
     const data=await request({type:'REPORTS'});
     if(context!==currentContext||data.context!==context)return;
     const signature=JSON.stringify([data.reports,data.missions,data.fuelQuotes,data.geometry]);
-    if(signature!==lastRecordsSignature){records=data.reports;missions=data.missions||[];fuelQuotes=data.fuelQuotes||[];geometry=data.geometry||{};renderAnalytics();lastRecordsSignature=signature;}
+    if(signature!==lastRecordsSignature){records=data.reports;missions=data.missions||[];fuelQuotes=data.fuelQuotes||[];geometry=data.geometry||{};lastRecordsSignature=signature;analyticsCache=new Map();prefetchAnalytics();renderAnalytics();renderSearch(true);}
     lastReportStamp=stamp;
   }catch(error){
     if(context===currentContext){$('analytics-loading-state').textContent='Could not load analytics. Try again.';$('analytics-loading-state').classList.add('text-rose-300');}
@@ -145,7 +151,9 @@ async function refreshBeltData(stamp){
   }catch(error){if(context===currentContext)$('error').textContent=error.message;}
   finally{if(context===currentContext&&scanId&&lastBeltScanId===scanId)nextBeltReadAt=Date.now()+4000;}
 }
-function renderAnalytics(){const now=Date.now();lastCalendarStamp=calendarStamp(period,now);analysis=analyze(records,period,now,missions,fuelQuotes,geometry);
+function cachedAnalysis(selected,now=Date.now()){const key=`${currentContext}:${lastRecordsSignature}:${selected}:${calendarStamp(selected,now)}`;if(!analyticsCache.has(key))analyticsCache.set(key,analyze(records,selected,now,missions,fuelQuotes,geometry));return analyticsCache.get(key);}
+function prefetchAnalytics(){const now=Date.now();for(const selected of ['total','day','week'])cachedAnalysis(selected,now);}
+function renderAnalytics(){const now=Date.now();lastCalendarStamp=calendarStamp(period,now);analysis=cachedAnalysis(period,now);
   renderSection('summary',[analysis.runs,analysis.resources,analysis.averageDuration],()=>{$('runs').textContent=fmt(analysis.runs);$('resources').textContent=fmt(analysis.resources);$('duration').textContent=formatDuration(analysis.averageDuration);});
   renderSection('resources',analysis.totals,()=>{
   $('total-yields').replaceChildren(...resourceTotals(analysis.totals).map(({total,label})=>{const row=el('div',undefined,'value-row'),value=el('strong',fmt(total)+' ','green');value.append(el('span','total','font-normal text-slate-400'));row.append(el('span',label),value);return row;}));
@@ -162,7 +170,7 @@ function renderMechanics(){const m=analysis.mechanics,container=$('mining-mechan
   $('cycles').append(el('span',`${rate(m.average)} avg cycles/run`,'muted push'));
   if(m.breakdowns.length){container.append(el('h3','AVERAGE BREAKDOWN RATE'));const grid=el('div',undefined,'two');for(const b of m.breakdowns){const row=el('div',undefined,'value-row breakdown-row');row.append(el('span',b.label),el('strong',b.perCycle===null?'—':`${rate(b.perCycle)}% / ship / cycle`,'gold'),el('span',`${rate(b.returned)}% returned broken`,'gold'));grid.append(row);}container.append(grid);}
   const yields=(title,data)=>{const head=el('div',undefined,'row mechanics-heading');head.append(el('h3',title),el('span',`${fmt(data.runs)} runs`,'run-badge'));container.append(head);const grid=el('div',undefined,'two');for(const r of data.rows){const row=el('div',undefined,'value-row'),label=el('span');label.append(el('span',r.label+' '),el('span',r.hull,'muted'));const value=el('strong',r.value===null?'—':`${rate(r.value)} / ship / cycle`,r.value===null?'text-slate-600':'green');if(r.preliminary)value.append(el('span',`Early sample · ${r.runs} run${r.runs===1?'':'s'}`,'block text-[10px] font-normal text-slate-400'));row.append(label,value);grid.append(row);}container.append(grid);};
-  yields('DEDICATED SHIP YIELDS',m.dedicated);container.append(el('h3','EXCAVATORS ONLY — TOTAL MINING RUNS AND CYCLES'));const totals=el('div',undefined,'value-row cyan');totals.append(el('strong',`${fmt(m.excavatorTotals.runs)} completed runs · ${fmt(m.excavatorTotals.cycles)} cycles`),el('span',`${rate(m.excavatorTotals.average)} avg cycles/run`,'muted'));container.append(totals);yields('EXCAVATORS ONLY YIELD',m.excavators);
+  yields('DEDICATED SHIP YIELDS',m.dedicated);
 }
 function renderChart(){if(!analysis)return;
   const history=analysis.yieldHistory,buckets=history.buckets||[],dateLabel=epoch=>new Date(epoch*1000).toLocaleDateString(undefined,{day:'2-digit',month:'short'});
@@ -178,17 +186,18 @@ function renderSearch(force=false){
   $('scan-status').classList.toggle('text-rose-400',!!outcome?.error);
   $('refresh-last-updated').textContent=exactUpdateLabel(exactUpdatedAt);
   if(!validDisplayFilter(filter()))return;
-  const signature=JSON.stringify([lastBeltsStamp,filter(),sent,$('search-origin').value,markers?.activeSystemIds,markers?.stale,matchedColumnCount()]);if(!force&&signature===lastScanSignature)return;lastScanSignature=signature;
+  const signature=JSON.stringify([lastBeltsStamp,filter(),sent,$('search-origin').value,markers?.activeSystemIds,markers?.activeFieldIds,markers?.stale,matchedColumnCount(),destinationControls.wantsOptimization(),lastRecordsSignature]);if(!force&&signature===lastScanSignature)return;lastScanSignature=signature;
   const selected=(preferences.locations||[]).find(l=>String(l.id)===$('search-origin').value);
-  const results=matches(distancesFrom(cachedBelts,mapSystems,selected?.system_id),filter());$('match-count').textContent=`${results.length} Systems · ${results.reduce((n,s)=>n+s.belts.length,0)} Belts`;$('matches-empty').hidden=!!results.length;
-  $('matches-empty').textContent=scanState?'No checked systems match these filters.':'No scan results yet.';
-  const automatic=new Set(markers?.activeSystemIds||[]);
-  renderDesktopResults(results.map(s=>({system_id:s.id,system_name:s.name,distance:s.distance,security_zone:s.securityZone,sent_at:sent[s.id]||automatic.has(String(s.id))?1:null,belts:s.belts.map(b=>({field_type:b.type,richness:b.richness,total_resources:b.total,remaining_pct:b.remaining}))})),{copySystemName,setSystemSent:async(id,value)=>{
+  const results=matches(distancesFrom(cachedBelts,mapSystems,selected?.system_id),filter()),generation=++searchRenderGeneration;
+  const render=shown=>{if(generation!==searchRenderGeneration)return;$('match-count').textContent=`${shown.length} Systems · ${shown.reduce((n,s)=>n+s.belts.length,0)} Belts`;$('matches-empty').hidden=!!shown.length;$('matches-empty').textContent=scanState?'No checked systems match these filters.':'No scan results yet.';const automatic=new Set(markers?.activeSystemIds||[]),automaticFields=new Set(markers?.activeFieldIds||[]);
+  renderDesktopResults(shown.map(s=>({system_id:s.id,system_name:s.name,distance:s.distance,security_zone:s.securityZone,sent_at:sent[s.id]||automatic.has(String(s.id))?1:null,belts:s.belts.map(b=>({field_id:b.id,field_type:b.type,richness:b.richness,total_resources:b.total,remaining_pct:b.remaining,sent_at:automaticFields.has(String(b.id))?1:null,estimate:b.estimate||null}))})),{copySystemName,setSystemSent:async(id,value)=>{
     try{const result=await request({type:'SET_SENT',systemId:id,sent:value});sent=result.manualSent;renderSearch(true);showToast(value?'Fleet marked as sent':'Fleet marker cleared');}
     catch(error){showToast(`Could not update fleet marker: ${error.message}`,true);}
   }});
   $('matches').querySelectorAll('[data-toggle-sent]').forEach(b=>{b.title=markers?.stale?'Mission sync delayed; showing last known state':automatic.has(b.dataset.toggleSent)?'Active mining fleet':sent[b.dataset.toggleSent]?'Click to clear manual marker':'Click to mark sent';});
-  $('matches-empty').hidden=true;
+  };
+  if(!destinationControls.wantsOptimization()){destinationControls.showResult(null);render(results);return;}
+  void (async()=>{await destinationControls.prepare();if(generation!==searchRenderGeneration)return;if(!destinationControls.isEnabled()){render(results);return;}try{const lifetime=cachedAnalysis('total'),rates=breakdownRatesWithBaseline(lifetime.mechanics.breakdowns),optimized=destinationControls.optimize(results,rates);destinationControls.showResult(optimized.optimization);render(optimized.systems);}catch(error){destinationControls.showResult({message:error.message});render(results);}})();
 }
 function renderScanControls(){
   const updating=scanStarting||!!scanState?.running,stopping=scanStopping||!!(scanState?.running&&scanState?.cancelled);
@@ -199,7 +208,7 @@ function renderScanControls(){
 }
 $('agree').onclick=guard(async()=>{await request({type:'CONSENT',accepted:true});$('agreement').close();await refresh();});$('disagree').onclick=guard(async()=>{await request({type:'CONSENT',accepted:false});$('agreement').close();await refresh();});$('agreement').addEventListener('cancel',e=>e.preventDefault());$('review').onclick=()=>$('agreement').showModal();
 $('connect').onclick=guard(async()=>{const b=$('connect');b.disabled=true;b.textContent='Connecting…';try{await request({type:'CONNECT',origin:$('seasons').value});showSeason=false;currentContext='';await refresh();}finally{b.disabled=false;b.textContent='Connect';}});
-$('change-season').onclick=()=>{showSeason=!showSeason;$('season-panel').hidden=!showSeason;};
+$('change-season').onclick=()=>{showSeason=!showSeason;$('season-panel').hidden=!showSeason;$('destination-fleet-toggle').hidden=showSeason;if(showSeason)$('destination-fleet-panel').open=false;};
 $('sync').onclick=guard(async()=>{
  const button=$('sync');button.disabled=true;button.textContent='Syncing…';$('analytics-body').setAttribute('aria-busy','true');
  try{await request({type:'SYNC'});await refresh();}
@@ -209,7 +218,7 @@ document.querySelectorAll('[data-hide]').forEach(b=>{b.setAttribute('aria-contro
 function updateFilterButtons(){updateSearchButtons(document,searchFilter,$('custom-richness').value!=='');}
 document.querySelectorAll('[data-onclick]').forEach(b=>{
  const action=b.dataset.onclick,match=action.match(/^(setRichness|setPct|setZone|setOreType)\(([^,)]+)/);
- if(match)b.onclick=guard(async()=>{const key={setRichness:'richness',setPct:'remaining',setZone:'zone',setOreType:'type'}[match[1]],raw=match[2].replaceAll("'",'');searchFilter[key]=['richness','remaining'].includes(key)?Number(raw):raw;if(key==='richness')$('custom-richness').value='';updateFilterButtons();renderSearch(true);await savePreferences();});
+ if(match)b.onclick=guard(async()=>{const key={setRichness:'richness',setPct:'remaining',setZone:'zone',setOreType:'type'}[match[1]],raw=match[2].replaceAll("'",'');searchFilter[key]=['richness','remaining'].includes(key)?Number(raw):raw;if(key==='richness')$('custom-richness').value='';if(key==='type')destinationControls.selectResource(raw);updateFilterButtons();renderSearch(true);await savePreferences();});
  else if(action==='openLocationsModal()')b.onclick=()=>{showLocations();locationMessage('');$('location-label-input').focus();};
  else if(action==='closeLocationsModal()')b.onclick=()=>$('locations-modal').classList.add('hidden');
  else if(action==='addSavedLocation()')b.onclick=guard(async()=>{

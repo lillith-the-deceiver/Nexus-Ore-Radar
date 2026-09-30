@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Nexus Ore Radar",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "description": "Find mining belts and track mining results. Requires sharing Season 0 mining pirate-raid reports.",
   "permissions": [
     "storage",

@@ -19,7 +19,7 @@ export function mechanicsSamples(records,missions=[]){
  const ordered=records.filter(r=>['mining','delivery'].includes(String(r?.reportType||'').toLowerCase())&&r.id!=null&&r.id!==''&&['mining','mine'].includes(r._radarSource??'mining')).map(r=>({r,epoch:operationEpoch(r.createdAt)})).sort((a,b)=>(b.epoch??-Infinity)-(a.epoch??-Infinity));
  for(const {r} of ordered){const key=r.missionId!=null&&r.missionId!==''?String(r.missionId):`${r._radarSource??'mining'}:${r.id}`;if(unique.has(key))continue;
   let fleet=byMission.get(String(r.missionId))?.fleetComposition;if(!Object.values(fleetCounts(fleet)).some(n=>n>0))fleet=r.fleetComposition??[];
-  unique.set(key,{counts:fleetCounts(fleet),excavatorOnly:excavatorOnly(fleet),amounts:resourceBreakdown(r.resourcesDelivered),cycles:Math.trunc(operationNumber(r.cycleCount||r.resourcesDelivered?._cyclesDone))||null,breakdowns:observedBreakdowns(r)});
+  const completedAt=operationEpoch(r.createdAt);unique.set(key,{at:completedAt===null?NaN:completedAt*1000,counts:fleetCounts(fleet),excavatorOnly:excavatorOnly(fleet),amounts:resourceBreakdown(r.resourcesDelivered),cycles:Math.trunc(operationNumber(r.cycleCount||r.resourcesDelivered?._cyclesDone))||null,breakdowns:observedBreakdowns(r)});
  }return [...unique.values()];
 }
 export function mechanics(runs){
@@ -30,7 +30,7 @@ export function mechanics(runs){
     const valid=runs.filter(r=>r.counts[key]>0&&!(r.counts[key==='miner'?'ice_drill':'miner']>0)&&r.breakdowns!==null);
     if(!valid.length)continue;
     const sent=valid.reduce((n,r)=>n+r.counts[key],0),broken=valid.reduce((n,r)=>n+r.breakdowns,0),cycled=valid.filter(r=>r.cycles>0),exposure=cycled.reduce((n,r)=>n+r.counts[key]*r.cycles,0);
-    breakdowns.push({label,perCycle:exposure?100*cycled.reduce((n,r)=>n+r.breakdowns,0)/exposure:null,returned:sent?100*broken/sent:null});
+    breakdowns.push({key,label,perCycle:exposure?100*cycled.reduce((n,r)=>n+r.breakdowns,0)/exposure:null,returned:sent?100*broken/sent:null,runs:valid.length});
   }
   const specs=[['Ore + Silicates','miner','Mining Vessel',['ore','silicates']],['Hydrogen','gas_collector','Gas Collector',['hydrogen','gas']],['Plasma Core','miner','Mining Vessel',['plasma_core','plasma']],['Cryo-ice','ice_drill','Ice Drill',['cryo_ice','ice']]];
   const yields=excavators=>{const used=new Set();const rows=specs.map(([label,key,hull,materials])=>{let amount=0,exposure=0,count=0;

@@ -56,19 +56,19 @@ export function miningRuns(records,missions=[],quotes=[],geometry={}) {
   return [...unique.values()];
 }
 export function analyze(records,period='total',now=Date.now(),missions=[],quotes=[],geometry={}) {
-  const samples=mechanicsSamples(records,missions);
-  const all=miningRuns(records,missions,quotes,geometry),start=calendarStart(period,now),runs=all.filter(r=>r.at>=start&&r.at<=now);
+  const start=calendarStart(period,now),samples=mechanicsSamples(records,missions).filter(sample=>Number.isFinite(sample.at)&&sample.at>=start);
+  const all=miningRuns(records,missions,quotes,geometry),runs=all.filter(r=>r.at>=start&&r.at<=now);
   const timed=runs.filter(r=>r.duration!==null);
   const totals={};for(const r of runs)for(const [key,value] of Object.entries(r.amounts))totals[key]=(Object.hasOwn(totals,key)?totals[key]:0)+value;
   const tables={};
   for(const category of ['dedicated','excavators']) {
-    const own=all.filter(r=>r.category===category);
+    const own=runs.filter(r=>r.category===category);
     tables[category]={runs:own.length,rows:GROUPS.map(([key,label])=>{
       const [belt,materials]={ore:['ore',['ore','silicates']],hydrogen:['gas',['hydrogen','gas']],plasma_core:['plasma',['plasma_core','plasma']],cryo_ice:['ice',['cryo_ice','ice']]}[key];
       const matching=own.filter(r=>r.fieldType===belt);
       const values=matching.map(r=>materials.reduce((sum,k)=>sum+(fuelNumber(r.amounts[k])??0),0));
       const fuels=matching.filter(r=>r.fuel!==null).map(r=>r.fuel);
-      return {key,label,runs:values.length,fuelRuns:fuels.length,apiQuoteRuns:matching.filter(r=>r.fuelSource==='api').length,estimatedRuns:matching.filter(r=>r.fuelSource==='estimate').length,fuelMean:values.length&&fuels.length===values.length?fuels.reduce((a,b)=>a+b,0)/values.length:null,fuelMedian:quantile(fuels,.5),fuelLow:quantile(fuels,.25),fuelHigh:quantile(fuels,.75),mean:values.length?values.reduce((a,b)=>a+b,0)/values.length:null,
+      return {key,label,runs:values.length,fuelRuns:fuels.length,apiQuoteRuns:matching.filter(r=>r.fuelSource==='api').length,estimatedRuns:matching.filter(r=>r.fuelSource==='estimate').length,fuelMean:fuels.length?fuels.reduce((a,b)=>a+b,0)/fuels.length:null,fuelMedian:quantile(fuels,.5),fuelLow:quantile(fuels,.25),fuelHigh:quantile(fuels,.75),mean:values.length?values.reduce((a,b)=>a+b,0)/values.length:null,
         median:quantile(values,.5),low:quantile(values,.25),high:quantile(values,.75)};
     })};
   }

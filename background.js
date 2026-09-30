@@ -6,7 +6,7 @@ import {refreshMapSnapshot} from './map-refresh.js';
 import {relinkMissionReports} from './db.js';
 import {captureReportFeeds,counts,reportsFor,saveMissions,missionsFor,leaseFuelQuote,saveFuelQuote,fuelQuotesFor,searchExamplesFor,recordSearchOutcome,cachedSystemsFor} from './db.js';
 import {quoteResult} from './fuel.js';
-import {decodeMissions,activeLinkedMiningSystems} from './missions.js';
+import {decodeMissions,activeLinkedMiningSystems,activeLinkedMiningFields} from './missions.js';
 import {candidates,fields,list} from './search.js';
 import {rankDetailCandidates,outcomeModel} from './search-ranking.js';
 import {STATE_PROTOCOL} from './connection-state.js';
@@ -16,17 +16,19 @@ import {pumpContributions} from './upload-worker.js';
 import {RequestPacing,detailWithRetries} from './request-pacing.js';
 import {runScanQueue} from './scan-scheduler.js';
 import {manualMarkerStore} from './manual-markers.js';
-import {saveFieldIndex,visibleSystemsFor,clearExactBeltCache,mapDataFor,saveMapData,clearExtensionDatabase} from './db.js';
+import {saveFieldIndex,visibleSystemsFor,clearExactBeltCache,mapDataFor,saveMapData,clearExtensionDatabase,metadataFor,saveMetadata} from './db.js';
 import {scanProgress} from './scan-progress.js';
 import {deferredUpdate,refreshUpdatedDashboards} from './release-updates.js';
 import {reportsAfterFirstUse,reportBaselineKey} from './report-baseline.js';
 import {resetExtensionDataForUpdate} from './update-reset.js';
+import {REFRESH_MS,shipSnapshot,destinationCatalog,validateFleet} from './destination-estimates.js';
 const pacing=new RequestPacing();
 const manualMarkers=manualMarkerStore(chrome.storage.local);
 let busy=false,lastAttempt=0;
-let missionBusy=false,quoteBusy=false,lastMissionAttempt=0;
+let missionBusy=false,quoteBusy=false,missionTask=null;
 const missionSnapshots=new Map();
 let searchBusy=false;
+let scanPreparation=null;
 let activeScan=null;
 let lifecycleReady=Promise.resolve();
 let updateMessages=0,updateUploads=0;
@@ -49,7 +51,7 @@ async function loadMapFor(c,force=false){
   const previous=await mapDataFor(c.context);
   let result={data:previous,refreshed:false,planetsRefreshed:false};
   if(force||!previous){
-    result=await refreshMapSnapshot(path=>searchRead(c,path,path==='/api/galaxy/map'),previous);
+    result=await refreshMapSnapshot(path=>searchRead(c,path,path==='/api/galaxy/map',true),previous);
     const identity=await searchRead(c,'/api/auth/me',false);
     if(contextKey(c.origin,identity?.user?.id)!==c.context||(await activeContext()).context!==c.context)throw Error('Account or season changed.');
     result.data={...result.data,context:c.context};
@@ -99,7 +101,6 @@ async function establishConnection(origin,force=false){
   await reportsSinceFirstUse(context,[]);
   const connection={origin,context,tabId:tab.id,username:identity.user.username||'Nexus player'};
   await chrome.storage.session.set({connection,status:{...connection,state:'connected',at:Date.now(),message:`Connected to ${SEASONS.find(s=>s.origin===origin).name}. Capturing reports…`}});
-  void syncMissions(tab,origin,context,force);
   return selected;
 }
 async function sync(force=false) {
@@ -114,6 +115,7 @@ async function sync(force=false) {
     const origin=seasonOrigin(settings.origin);
     if(!(await matchingTabs(origin)).length) {await setStatus({state:'waiting',message:'Open Nexus in the selected season to capture reports.'});return;}
     const {tab,identity,context}=await establishConnection(origin,force);
+    await syncMissions(tab,origin,context,true);
     const userId=identity?.user?.id;
     const {feeds,errors}=await readReportFeeds(path=>read(tab.id,origin,path,false));
     // Detect a changed account before attributing the response to it.
@@ -138,9 +140,10 @@ async function sync(force=false) {
   finally {busy=false;releaseUpdate.check();}
 }
 async function syncMissions(tab,origin,context,force=false){
-    if(missionBusy||(!force&&Date.now()-lastMissionAttempt<3000))return;
-    missionBusy=true;lastMissionAttempt=Date.now();
-    try{
+    if(missionTask){try{await missionTask;}catch{}}
+    if(!force&&missionSnapshots.has(context))return missionSnapshots.get(context);
+    missionBusy=true;
+    missionTask=(async()=>{try{
       const validate=async()=>{
         const settings=await getSettings();
         if(!hasConsent(settings)||!settings.enabled||settings.origin!==origin||!(await matchingTabs(origin)).length)throw Error('Account, season or connection changed.');
@@ -154,11 +157,13 @@ async function syncMissions(tab,origin,context,force=false){
       for(const s of await cachedSystemsFor(context))knownSystems.set(String(s.id),s);
       const {links,changed}=await saveMissions(context,missions,[...knownSystems.values()]);
       if(changed)await analyticsChanged(context);
-      await chrome.storage.session.set({missionMarkers:{context,activeSystemIds:activeLinkedMiningSystems(missions,links),at:Date.now(),stale:false}});
+      await chrome.storage.session.set({missionMarkers:{context,activeSystemIds:activeLinkedMiningSystems(missions,links),activeFieldIds:activeLinkedMiningFields(missions,links),at:Date.now(),stale:false}});
       missionSnapshots.set(context,missions);
       void syncQuote(tab,origin,context,missions);
-    }catch(error){const previous=(await chrome.storage.session.get('missionMarkers')).missionMarkers;await chrome.storage.session.set({missionMarkers:{...(previous?.context===context?previous:{context,activeSystemIds:[]}),stale:true,error:error.message}});}
-    finally{missionBusy=false;releaseUpdate.check();}
+      return missions;
+    }catch(error){const previous=(await chrome.storage.session.get('missionMarkers')).missionMarkers;await chrome.storage.session.set({missionMarkers:{...(previous?.context===context?previous:{context,activeSystemIds:[],activeFieldIds:[]}),stale:true,error:error.message}});return missionSnapshots.get(context)||[];}
+    finally{missionBusy=false;missionTask=null;releaseUpdate.check();}})();
+    return missionTask;
 }
 async function syncQuote(tab,origin,context,missions){
     if(quoteBusy)return;quoteBusy=true;
@@ -180,13 +185,7 @@ async function validateOperationContext(origin,context){
   if(!hasConsent(settings)||!settings.enabled||settings.origin!==origin||connection?.context!==context||!(await matchingTabs(origin)).length)throw Error('Account, season or connection changed.');
 }
 async function pollOperations(force=false){
-  const reports=sync(force);
-  try{
-    const settings=await getSettings(),c=(await chrome.storage.session.get('connection')).connection;
-    if(hasConsent(settings)&&settings.enabled&&c?.origin===settings.origin){
-      try{const {tab}=await authenticatedTab(c.origin,c.context,c.tabId);void syncMissions(tab,c.origin,c.context,force);const missions=missionSnapshots.get(c.context);if(missions)void syncQuote(tab,c.origin,c.context,missions);}catch{}
-    }
-  }finally{await reports;}
+  await sync(force);
 }
 async function dashboard() {
   const url=chrome.runtime.getURL('dashboard.html');
@@ -198,7 +197,7 @@ async function activeContext() {
   if(!hasConsent(settings)||!settings.enabled||!c||settings.origin!==c.origin)throw Error('Connect to a season first.');
   return c;
 }
-async function searchRead(c,path,verifyIdentity=true) {
+async function searchRead(c,path,verifyIdentity=true,priority=false) {
   const validate=async()=>{
     if((await activeContext()).context!==c.context)throw Object.assign(Error('Account or season changed.'),{status:409,contextChanged:true});
   };
@@ -208,7 +207,30 @@ async function searchRead(c,path,verifyIdentity=true) {
     const selected=await authenticatedTab(c.origin,c.context,c.tabId,validate);tab=selected.tab;
     if(c.tabId!==tab.id){c.tabId=tab.id;await chrome.storage.session.set({connection:c});}
   }
-  return read(tab.id,c.origin,path,false,validate);
+  return read(tab.id,c.origin,path,priority,validate);
+}
+
+function payload(value){return value?.data&&typeof value.data==='object'?value.data:value;}
+async function destinationSnapshot(c){
+  let snapshot=await metadataFor(c.context,'destination-ship-snapshot'),now=Date.now();
+  if(snapshot&&Array.isArray(snapshot.ships)&&now-Number(snapshot.updated_at||0)<REFRESH_MS)return snapshot;
+  try{
+    const planetsBody=payload(await searchRead(c,'/api/planets',false)),planets=Array.isArray(planetsBody)?planetsBody:planetsBody?.planets;
+    const planetId=Array.isArray(planets)?planets.find(planet=>planet&&planet.id!=null)?.id:null;if(planetId==null)throw Error('Current ship data is unavailable.');
+    const yard=payload(await searchRead(c,`/api/planets/${planetId}/shipyard`,false)),ships=yard?.ships;
+    if(!Array.isArray(ships))throw Error('Current ship data is unavailable.');
+    const clean=ships.map(shipSnapshot).filter(Boolean);if(!clean.length||!clean.some(ship=>Object.keys(ship.mining_rates).length))throw Error('Current ship data is unavailable.');
+    const identity=await searchRead(c,'/api/auth/me',true);
+    if(contextKey(c.origin,identity?.user?.id)!==c.context||(await activeContext()).context!==c.context)throw Error('Account or season changed.');
+    snapshot={updated_at:now,ships:clean};await saveMetadata(c.context,'destination-ship-snapshot',snapshot);return snapshot;
+  }catch(error){if(snapshot&&Array.isArray(snapshot.ships))return snapshot;throw error;}
+}
+function normalizedDestinationState(value){
+ const state=value&&typeof value==='object'&&!Array.isArray(value)?value:{},names=new Set(),presets=[];
+ if(state.presets!==undefined&&!Array.isArray(state.presets))throw Error('Saved fleet presets are invalid.');
+ for(const row of state.presets||[]){const name=typeof row?.name==='string'?row.name.trim():'';if(!name||name.length>80||names.has(name))throw Error('Saved fleet presets are invalid.');names.add(name);presets.push({name,fleet:validateFleet(row.fleet)});}
+ let lastPreset=typeof state.lastPreset==='string'?state.lastPreset.trim():'';if(lastPreset&&!names.has(lastPreset))lastPreset='';
+ return {presets,lastPreset,remembered:state.remembered===true};
 }
 async function runScan(job,c){
   const started=performance.now();
@@ -295,6 +317,13 @@ chrome.runtime.onMessage.addListener((msg,sender,respond)=>{
     }
     if(msg.type==='SYNC') {await pollOperations(true);return {ok:true};}
     if(msg.type==='REPORTS'){const c=await activeContext(),saved=await storedMapFor(c.context);return {context:c.context,reports:await reportsFor(c.context),missions:await missionsFor(c.context),fuelQuotes:await fuelQuotesFor(c.context),geometry:saved?.context===c.context?{systems:list(saved.map,'systems'),planets:list(saved.planets,'planets')}:{systems:[],planets:[]}};}
+    if(msg.type==='DESTINATION_DATA'){
+      const c=await activeContext(),snapshot=await destinationSnapshot(c),state=normalizedDestinationState(await metadataFor(c.context,'destination-state'));
+      return {context:c.context,snapshot,catalog:destinationCatalog(snapshot),state};
+    }
+    if(msg.type==='SAVE_DESTINATION_STATE'){
+      const c=await activeContext(),state=normalizedDestinationState(msg.state);await saveMetadata(c.context,'destination-state',state);return {context:c.context,state};
+    }
     if(msg.type==='BELTS'){const c=await activeContext(),saved=await storedMapFor(c.context);return {context:c.context,systems:await visibleSystemsFor(c.context),lastExactUpdate:lastExactUpdate(await cachedSystemsFor(c.context)),mapSystems:saved?.context===c.context?list(saved.map,'systems'):null};}
     if(msg.type==='SET_SENT'){
       const c=await activeContext(),id=Number(msg.systemId);if(!Number.isSafeInteger(id)||id<=0)throw Error('System ID must be a positive whole number.');
@@ -315,25 +344,26 @@ chrome.runtime.onMessage.addListener((msg,sender,respond)=>{
     }
     if(msg.type==='START_SCAN'){
       if(searchBusy||activeScan)throw Error('Search request already running.');searchBusy=true;
-      try{const c=await activeContext();let saved=await storedMapFor(c.context);
-        if(!saved)saved=(await loadMapFor(c,true)).data;
-        const index=await searchRead(c,'/api/galaxy/field-index');
+      const preparation={id:crypto.randomUUID(),cancelled:false};scanPreparation=preparation;
+      try{const c=await activeContext();preparation.context=c.context;const validatePreparation=()=>{if(preparation.cancelled)throw Error('Update cancelled.');};let saved=await storedMapFor(c.context);
+        if(!saved)saved=(await loadMapFor(c,true)).data;validatePreparation();
+        const index=await searchRead(c,'/api/galaxy/field-index',true,true);validatePreparation();
         await saveFieldIndex(c.context,list(index,'systems'));
         const queue=candidates(saved.map,index,msg.originId,Number(msg.radius),{examples:await searchExamplesFor(c.context),sent:await manualMarkers.get(c.context)});
         const updatedMap={...saved,map:indexSystems(list(saved.map,'systems'),normalizedFieldIndex(index))};
         await saveMapData(c.context,updatedMap);
-        await clearExactBeltCache(c.context);
+        validatePreparation();await clearExactBeltCache(c.context);
         await beltsChanged(c.context);
         const job={id:crypto.randomUUID(),context:c.context,queue,done:0,running:queue.length>0,startedAt:Date.now()};
         await chrome.storage.session.set({scan:scanProgress(job)});
         if(job.running){activeScan=job;void runScan(job,c).catch(()=>{if(activeScan===job)activeScan=null;});}
         return {ok:true};
-      }finally{searchBusy=false;}
+      }finally{if(scanPreparation===preparation)scanPreparation=null;searchBusy=false;}
     }
     // Compatibility for a dashboard loaded before this worker update. It no
     // longer advances the queue; the background scheduler owns scan progress.
     if(msg.type==='SCAN_STEP')return {ok:true};
-    if(msg.type==='CANCEL_SCAN'){const job=activeScan||(await chrome.storage.session.get('scan')).scan;if(job){job.running=!!activeScan;job.cancelled=true;await chrome.storage.session.set({scan:scanProgress(job)});}return {ok:true};}
+    if(msg.type==='CANCEL_SCAN'){if(scanPreparation)scanPreparation.cancelled=true;const job=activeScan||(await chrome.storage.session.get('scan')).scan;if(job){job.running=!!activeScan;job.cancelled=true;await chrome.storage.session.set({scan:scanProgress(job)});}return {ok:true};}
     throw Error('Unsupported action');
   })().then(respond,error=>respond({error:error.message})).finally(()=>{updateMessages--;releaseUpdate.check();});return true;
 });

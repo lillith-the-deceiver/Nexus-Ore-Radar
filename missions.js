@@ -36,6 +36,9 @@ export function activeLinkedMiningSystems(missions,links){
  const active=new Set(activeMiningSystems(missions.map(m=>({...m,targetSystemId:links[String(m.id)]?.systemId,target_system_id:undefined}))));
  return [...active];
 }
+export function activeLinkedMiningFields(missions,links){
+ return [...new Set(missions.filter(m=>['mine','mining'].includes(String(m.missionType||'').trim().toLowerCase())&&!['','completed','complete','cancelled','canceled','failed','expired'].includes(String(m.status||'').trim().toLowerCase())).map(m=>links[String(m.id)]?.fieldId).filter(id=>id!==undefined&&id!==null).map(String))];
+}
 export function activeMiningSystems(missions,systems){return [...new Set(missions.filter(m=>['mine','mining'].includes(String(m.missionType||'').trim().toLowerCase())&&!['','completed','complete','cancelled','canceled','failed','expired'].includes(String(m.status||'').trim().toLowerCase())).map(m=>systems?linkedSystemId(m,systems):m.targetSystemId??m.target_system_id).filter(id=>id!==undefined&&id!==null).map(String))];}
 export function missionDuration(report,mission){
  if(!mission||String(report.missionId)!==String(mission.id))return null;

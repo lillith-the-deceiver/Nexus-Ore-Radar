@@ -32,7 +32,7 @@
     @media(max-width:620px) { #analytics-yield-history { grid-template-columns:1fr; } }
     #yield-tables { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 26rem), 1fr)); gap: 12px; }
     .fuel-row { display: grid; grid-template-columns: minmax(0,1.35fr) minmax(0,1fr) minmax(0,1fr) minmax(0,.4fr); gap: 10px; align-items: center; }
-    #yield-tables { grid-template-columns: repeat(2,minmax(0,1fr)); align-items: start; }
+    #yield-tables { grid-template-columns: minmax(0,1fr); align-items: start; }
     #yield-tables summary { list-style: none; }
     #yield-tables summary::-webkit-details-marker { display: none; }
     .fuel-chevron::before { content: '› '; color: #38bdf8; }

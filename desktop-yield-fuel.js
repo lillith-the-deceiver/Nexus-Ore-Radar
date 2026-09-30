@@ -33,9 +33,8 @@ const escapeHtml=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;'
 
 export function desktopYieldFuelData(tables){
  const belts={ore:'ore',hydrogen:'gas',plasma_core:'plasma',cryo_ice:'ice'};
- return {groups:Object.entries(tables).map(([category,table])=>({
+ return {groups:Object.entries(tables).filter(([category])=>category==='dedicated').map(([category,table])=>({
   category:category==='excavators'?'excavators_only':'dedicated_ships',runs:table.runs,
   rows:table.rows.map(r=>({belt:belts[r.key],label:r.label,runs:r.runs,average_yield:r.mean,average_fuel:r.fuelMean,median_yield:r.median,yield_q1:r.low,yield_q3:r.high,median_fuel:r.fuelMedian,fuel_q1:r.fuelLow,fuel_q3:r.fuelHigh,fuel_runs:r.fuelRuns,api_quote_runs:r.apiQuoteRuns,estimated_runs:r.estimatedRuns}))
  }))};
 }
-
