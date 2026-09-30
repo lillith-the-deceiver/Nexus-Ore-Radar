@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.8 — 2026-09-30
+
+- Fixed missed mining reports during long or intensive play sessions.
+- Added an extension-owned six-second report capture loop that continues while the Nexus tab is hidden.
+- Prioritized short-lived report feeds and saved raw reports before mission linking, fuel calculations and uploads.
+- Added watchdog recovery if Chrome stops and later restarts the extension worker.
+
 ## 0.2.7 — 2026-09-30
 
 - Added Fleet & Presets with account-and-season-specific saved fleets.

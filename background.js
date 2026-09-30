@@ -24,8 +24,10 @@ import {resetExtensionDataForUpdate} from './update-reset.js';
 import {REFRESH_MS,shipSnapshot,destinationCatalog,validateFleet} from './destination-estimates.js';
 const pacing=new RequestPacing();
 const manualMarkers=manualMarkerStore(chrome.storage.local);
+const REPORT_CAPTURE_MS=6000;
 let busy=false,lastAttempt=0;
 let missionBusy=false,quoteBusy=false,missionTask=null;
+let captureTimer=null;
 const missionSnapshots=new Map();
 let searchBusy=false;
 let scanPreparation=null;
@@ -105,8 +107,9 @@ async function establishConnection(origin,force=false){
 }
 async function sync(force=false) {
   await lifecycleReady;
-  // Small timing tolerance avoids skipping a 2.5-second pulse due to jitter.
-  if(busy || (!force && Date.now()-lastAttempt<2300)) return;
+  // Match the Personal App's six-second report cadence. The worker-owned loop
+  // is independent of page visibility; manual Sync remains an explicit force.
+  if(busy || (!force && Date.now()-lastAttempt<REPORT_CAPTURE_MS-200)) return;
   busy=true;
   try {
     const settings=await getSettings();
@@ -115,9 +118,10 @@ async function sync(force=false) {
     const origin=seasonOrigin(settings.origin);
     if(!(await matchingTabs(origin)).length) {await setStatus({state:'waiting',message:'Open Nexus in the selected season to capture reports.'});return;}
     const {tab,identity,context}=await establishConnection(origin,force);
-    await syncMissions(tab,origin,context,true);
     const userId=identity?.user?.id;
-    const {feeds,errors}=await readReportFeeds(path=>read(tab.id,origin,path,false));
+    // These feeds are short-lived. Give them the next safe request slots and
+    // persist their raw payloads before any mission refresh or enrichment.
+    const {feeds,errors}=await readReportFeeds(path=>read(tab.id,origin,path,true));
     // Detect a changed account before attributing the response to it.
     const check=await read(tab.id,origin,'/api/auth/me',true);
     if(String(check?.user?.id)!==String(userId)) throw Error('Account changed during capture. Retrying without mixing accounts.');
@@ -125,8 +129,12 @@ async function sync(force=false) {
     if(!hasConsent(current) || !current.enabled || current.origin!==origin || !(await matchingTabs(origin)).length) return;
     const newFeeds=await reportsSinceFirstUse(context,feeds);
     let changed=await captureReportFeeds(context,newFeeds);
-    if(await relinkMissionReports(context))changed=true;
     if(changed)await analyticsChanged(context);
+    // Mission refresh, linking and quote capture are enrichment. None of them
+    // may delay the next report-feed read or the raw report commit above.
+    void syncMissions(tab,origin,context,true).then(async()=>{
+      if(await relinkMissionReports(context))await analyticsChanged(context);
+    }).catch(()=>{});
     if(!feeds.length)throw Error(errors.join('; '));
     const capturedCounts=await counts(context);
     const latest=await getSettings();
@@ -140,7 +148,7 @@ async function sync(force=false) {
   finally {busy=false;releaseUpdate.check();}
 }
 async function syncMissions(tab,origin,context,force=false){
-    if(missionTask){try{await missionTask;}catch{}}
+    if(missionTask)return missionTask;
     if(!force&&missionSnapshots.has(context))return missionSnapshots.get(context);
     missionBusy=true;
     missionTask=(async()=>{try{
@@ -187,6 +195,28 @@ async function validateOperationContext(origin,context){
 async function pollOperations(force=false){
   await sync(force);
 }
+function stopCaptureLoop(){
+  if(captureTimer!==null)clearTimeout(captureTimer);
+  captureTimer=null;
+}
+async function captureTick(force=false){
+  captureTimer=null;let keepRunning=false;
+  try{
+    const settings=await getSettings();
+    if(!hasConsent(settings)||!settings.enabled||!settings.origin)return;
+    const origin=seasonOrigin(settings.origin);
+    if(!(await matchingTabs(origin)).length)return;
+    keepRunning=true;
+    await pollOperations(force);
+  }catch{}
+  finally{if(keepRunning)ensureCaptureLoop(false);}
+}
+function ensureCaptureLoop(immediate=false,force=false){
+  if(captureTimer!==null)return;
+  captureTimer=setTimeout(()=>captureTick(force),immediate?0:REPORT_CAPTURE_MS);
+  captureTimer?.unref?.();
+}
+function restartCaptureLoop(){stopCaptureLoop();ensureCaptureLoop(true,true);}
 async function dashboard() {
   const url=chrome.runtime.getURL('dashboard.html');
   const tabs=await chrome.tabs.query({url});
@@ -274,17 +304,19 @@ async function runScan(job,c){
 }
 chrome.action.onClicked.addListener(()=>dashboard());
 chrome.runtime.onInstalled.addListener(details=>{
-  lifecycleReady=resetExtensionDataForUpdate(chrome,details,clearExtensionDatabase).then(()=>{chrome.alarms.create('capture',{periodInMinutes:.5});return refreshUpdatedDashboards(chrome,details);});
+  lifecycleReady=resetExtensionDataForUpdate(chrome,details,clearExtensionDatabase).then(()=>{chrome.alarms.create('capture',{periodInMinutes:.5});ensureCaptureLoop(true);return refreshUpdatedDashboards(chrome,details);});
   void lifecycleReady.catch(()=>{});
 });
-chrome.runtime.onStartup.addListener(()=>chrome.alarms.create('capture',{periodInMinutes:.5}));
-chrome.alarms.onAlarm.addListener(a=>{if(a.name==='capture')void pollOperations().catch(()=>{});});
+chrome.runtime.onStartup.addListener(()=>{chrome.alarms.create('capture',{periodInMinutes:.5});ensureCaptureLoop(true);});
+// Alarms are only a watchdog. The six-second extension worker loop owns the
+// normal capture cadence and an alarm restarts it if Chrome stopped the worker.
+chrome.alarms.onAlarm.addListener(a=>{if(a.name==='capture')ensureCaptureLoop(true);});
 chrome.runtime.onMessage.addListener((msg,sender,respond)=>{
   if(sender.id!==chrome.runtime.id) return;
   const ui=sender.url===chrome.runtime.getURL('dashboard.html');
   if(msg?.type==='GAME_PULSE') {
     if(!sender.tab?.url) return;
-    lifecycleReady.then(()=>getSettings()).then(s=>{try{if(seasonOrigin(sender.tab.url)===s.origin)return pollOperations();}catch{}}).then(()=>respond({ok:true}),()=>respond({ok:false}));
+    lifecycleReady.then(()=>getSettings()).then(s=>{try{if(seasonOrigin(sender.tab.url)===s.origin)ensureCaptureLoop(true);}catch{}}).then(()=>respond({ok:true}),()=>respond({ok:false}));
     return true;
   }
   if(!ui) return;
@@ -305,17 +337,17 @@ chrome.runtime.onMessage.addListener((msg,sender,respond)=>{
     if(msg.type==='CONSENT') {
       if(activeScan)activeScan.contextChanged=true;
       const s=await getSettings();s.consent={accepted:msg.accepted===true,version:CONSENT_VERSION,at:Date.now()};
-      s.enabled=false;await putSettings(s);await setStatus({state:'locked',message:s.consent.accepted?'Choose a season.':'Agreement declined. Radar is disabled.'});return {ok:true};
+      s.enabled=false;stopCaptureLoop();await putSettings(s);await setStatus({state:'locked',message:s.consent.accepted?'Choose a season.':'Agreement declined. Radar is disabled.'});return {ok:true};
     }
     if(msg.type==='CONNECT') {
       const s=await getSettings();if(!hasConsent(s))throw Error('Agreement required.');
       if(activeScan&&JSON.parse(activeScan.context)[0]!==seasonOrigin(msg.origin))activeScan.contextChanged=true;
       s.origin=seasonOrigin(msg.origin);s.enabled=true;await putSettings(s);await setStatus({state:'connecting',message:'Connecting to selected season…'});
       if(!(await matchingTabs(s.origin)).length){await setStatus({state:'waiting',message:'Open Nexus in the selected season to capture reports.'});return {ok:true};}
-      try{const connected=await establishConnection(s.origin,true);await chrome.storage.session.set({mapRefreshContext:connected.context});void sync(true);return {ok:true};}
+      try{const connected=await establishConnection(s.origin,true);await chrome.storage.session.set({mapRefreshContext:connected.context});restartCaptureLoop();return {ok:true};}
       catch(error){await setStatus({state:'error',message:error.message||'Connection failed.'});throw error;}
     }
-    if(msg.type==='SYNC') {await pollOperations(true);return {ok:true};}
+    if(msg.type==='SYNC') {await pollOperations(true);ensureCaptureLoop(false);return {ok:true};}
     if(msg.type==='REPORTS'){const c=await activeContext(),saved=await storedMapFor(c.context);return {context:c.context,reports:await reportsFor(c.context),missions:await missionsFor(c.context),fuelQuotes:await fuelQuotesFor(c.context),geometry:saved?.context===c.context?{systems:list(saved.map,'systems'),planets:list(saved.planets,'planets')}:{systems:[],planets:[]}};}
     if(msg.type==='DESTINATION_DATA'){
       const c=await activeContext(),snapshot=await destinationSnapshot(c),state=normalizedDestinationState(await metadataFor(c.context,'destination-state'));
