@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.9 — 2026-09-30
+
+- Added a Chrome side-panel view that is available only on Nexus Legacy tabs.
+- Added switching between the sidebar and full-tab views, remembering the last view used while keeping only one Radar view open.
+- Added a compact, responsive sidebar layout for narrow, medium and wide panel sizes.
+- Fixed the full-view Radar tab remaining open after switching to the sidebar.
+- Fixed Fleet & Presets stretching across wide sidebars, closing while fleet values were edited and losing input focus during refreshes.
+
 ## 0.2.8 — 2026-09-30
 
 - Fixed missed mining reports during long or intensive play sessions.

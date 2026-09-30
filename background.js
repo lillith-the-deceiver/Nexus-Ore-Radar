@@ -25,6 +25,9 @@ import {REFRESH_MS,shipSnapshot,destinationCatalog,validateFleet} from './destin
 const pacing=new RequestPacing();
 const manualMarkers=manualMarkerStore(chrome.storage.local);
 const REPORT_CAPTURE_MS=6000;
+const SIDE_PANEL_PATH='dashboard.html?view=side-panel';
+const VIEW_MODE_KEY='radarViewMode';
+let viewMode='side-panel';
 let busy=false,lastAttempt=0;
 let missionBusy=false,quoteBusy=false,missionTask=null;
 let captureTimer=null;
@@ -49,6 +52,20 @@ async function reportsSinceFirstUse(context,feeds){
   return result.feeds;
 }
 const storedMapFor=context=>mapDataFor(context);
+const isNexusUrl=url=>{
+  try{const origin=new URL(url).origin;return SEASONS.some(season=>season.origin===origin);}catch{return false;}
+};
+async function configureSidePanelTab(tab){
+  if(tab?.id===undefined)return;
+  const enabled=isNexusUrl(tab.url);
+  await chrome.sidePanel.setOptions(enabled?{tabId:tab.id,path:SIDE_PANEL_PATH,enabled:true}:{tabId:tab.id,enabled:false});
+  if(enabled)await chrome.action.enable?.(tab.id);else await chrome.action.disable?.(tab.id);
+}
+async function configureOpenNexusTabs(){
+  const found=new Map();
+  for(const season of SEASONS)for(const tab of await matchingTabs(season.origin))found.set(tab.id,tab);
+  await Promise.all([...found.values()].map(configureSidePanelTab));
+}
 async function loadMapFor(c,force=false){
   const previous=await mapDataFor(c.context);
   let result={data:previous,refreshed:false,planetsRefreshed:false};
@@ -214,13 +231,41 @@ async function captureTick(force=false){
 function ensureCaptureLoop(immediate=false,force=false){
   if(captureTimer!==null)return;
   captureTimer=setTimeout(()=>captureTick(force),immediate?0:REPORT_CAPTURE_MS);
+  // Node integration tests should not be kept alive by a browser timer.
   captureTimer?.unref?.();
 }
 function restartCaptureLoop(){stopCaptureLoop();ensureCaptureLoop(true,true);}
-async function dashboard() {
-  const url=chrome.runtime.getURL('dashboard.html');
-  const tabs=await chrome.tabs.query({url});
-  if(tabs[0]) await chrome.tabs.update(tabs[0].id,{active:true}); else await chrome.tabs.create({url});
+void chrome.storage.local.get(VIEW_MODE_KEY).then(stored=>{
+  viewMode=stored[VIEW_MODE_KEY]==='tab'?'tab':'side-panel';
+}).catch(()=>{});
+const rememberView=async mode=>{
+  viewMode=mode;
+  await chrome.storage.local.set({[VIEW_MODE_KEY]:mode});
+};
+async function dashboard(windowId,nexusTabId) {
+  try{await chrome.sidePanel.close({tabId:nexusTabId});}catch{}
+  const base=chrome.runtime.getURL('dashboard.html');
+  const url=`${base}?view=tab&nexusTab=${nexusTabId}`;
+  const tabs=await chrome.tabs.query({url:`${base}*`,windowId});
+  if(tabs[0]) await chrome.tabs.update(tabs[0].id,{active:true,url}); else await chrome.tabs.create({url,windowId});
+  await rememberView('tab');
+}
+async function closeDashboardTabs(){
+  const url=`${chrome.runtime.getURL('dashboard.html')}*`;
+  const dashboards=await chrome.tabs.query({url});
+  await Promise.all(dashboards.filter(candidate=>candidate.id!==undefined).map(candidate=>chrome.tabs.remove(candidate.id)));
+}
+async function openSidePanel(tab){
+  // Chrome requires sidePanel.open() to be called directly from the user
+  // gesture. Do not put any storage or tab work before this call.
+  const opening=chrome.sidePanel.open({tabId:tab.id});
+  await opening;
+  await closeDashboardTabs();
+  await rememberView('side-panel');
+}
+function openPreferredView(tab){
+  if(!isNexusUrl(tab?.url)||tab?.id===undefined)throw Error('Open Nexus before opening Radar.');
+  return viewMode==='tab'?dashboard(tab.windowId,tab.id):openSidePanel(tab);
 }
 async function activeContext() {
   const settings=await getSettings(), c=(await chrome.storage.session.get('connection')).connection;
@@ -302,20 +347,29 @@ async function runScan(job,c){
   }catch(e){job.error=e.message;}
   finally{job.running=false;await publish();if(activeScan===job)activeScan=null;releaseUpdate.check();}
 }
-chrome.action.onClicked.addListener(()=>dashboard());
+void Promise.resolve(chrome.action.disable?.()).then(configureOpenNexusTabs).catch(()=>{});
+void chrome.sidePanel.setPanelBehavior({openPanelOnActionClick:false}).catch(()=>{});
+chrome.action.onClicked.addListener(tab=>{void openPreferredView(tab).catch(()=>{});});
+chrome.sidePanel.onOpened?.addListener(info=>{
+  if(info.path===SIDE_PANEL_PATH&&info.tabId!==undefined)void closeDashboardTabs().then(()=>rememberView('side-panel')).catch(()=>{});
+});
+chrome.tabs.onUpdated?.addListener((tabId,changeInfo,tab)=>{
+  if(changeInfo.url||changeInfo.status==='loading')void configureSidePanelTab({...tab,id:tabId}).catch(()=>{});
+});
 chrome.runtime.onInstalled.addListener(details=>{
-  lifecycleReady=resetExtensionDataForUpdate(chrome,details,clearExtensionDatabase).then(()=>{chrome.alarms.create('capture',{periodInMinutes:.5});ensureCaptureLoop(true);return refreshUpdatedDashboards(chrome,details);});
+  lifecycleReady=resetExtensionDataForUpdate(chrome,details,clearExtensionDatabase).then(()=>{chrome.alarms.create('capture',{periodInMinutes:.5});ensureCaptureLoop(true);void configureOpenNexusTabs();return refreshUpdatedDashboards(chrome,details);});
   void lifecycleReady.catch(()=>{});
 });
-chrome.runtime.onStartup.addListener(()=>{chrome.alarms.create('capture',{periodInMinutes:.5});ensureCaptureLoop(true);});
+chrome.runtime.onStartup.addListener(()=>{chrome.alarms.create('capture',{periodInMinutes:.5});ensureCaptureLoop(true);void configureOpenNexusTabs();});
 // Alarms are only a watchdog. The six-second extension worker loop owns the
 // normal capture cadence and an alarm restarts it if Chrome stopped the worker.
 chrome.alarms.onAlarm.addListener(a=>{if(a.name==='capture')ensureCaptureLoop(true);});
 chrome.runtime.onMessage.addListener((msg,sender,respond)=>{
   if(sender.id!==chrome.runtime.id) return;
-  const ui=sender.url===chrome.runtime.getURL('dashboard.html');
+  const ui=sender.url?.split(/[?#]/,1)[0]===chrome.runtime.getURL('dashboard.html');
   if(msg?.type==='GAME_PULSE') {
     if(!sender.tab?.url) return;
+    void configureSidePanelTab(sender.tab).catch(()=>{});
     lifecycleReady.then(()=>getSettings()).then(s=>{try{if(seasonOrigin(sender.tab.url)===s.origin)ensureCaptureLoop(true);}catch{}}).then(()=>respond({ok:true}),()=>respond({ok:false}));
     return true;
   }
@@ -323,6 +377,14 @@ chrome.runtime.onMessage.addListener((msg,sender,respond)=>{
   updateMessages++;
   (async()=>{
     await lifecycleReady;
+    if(msg.type==='OPEN_FULL_VIEW') {
+      const windowId=Number(msg.windowId),nexusTabId=Number(msg.nexusTabId);
+      if(!Number.isSafeInteger(windowId)||windowId<0)throw Error('Radar window is unavailable.');
+      if(!Number.isSafeInteger(nexusTabId)||nexusTabId<0)throw Error('The associated Nexus tab is unavailable.');
+      const nexusTab=await chrome.tabs.get(nexusTabId);
+      if(!isNexusUrl(nexusTab?.url)||nexusTab.windowId!==windowId)throw Error('The associated Nexus tab is unavailable.');
+      await dashboard(windowId,nexusTabId);return {ok:true};
+    }
     if(msg.type==='STATE') {
       const seasons=SEASONS;
       const state=await chrome.storage.session.get(['status','connection','scan','missionMarkers','fuelUpdatedAt','analyticsRevision','beltsRevision']);

@@ -4,7 +4,7 @@ Chrome extension for Nexus Legacy with mining-belt search, saved origins, mining
 
 ## Install from GitHub
 
-1. Download [`Nexus-Ore-Radar-0.2.7-release.zip`](downloads/Nexus-Ore-Radar-0.2.7-release.zip?raw=1).
+1. Download [`Nexus-Ore-Radar-0.2.9-release.zip`](downloads/Nexus-Ore-Radar-0.2.9-release.zip?raw=1).
 2. Extract the ZIP to a permanent folder.
 3. Open `chrome://extensions` in Chrome.
 4. Enable **Developer mode**.
@@ -23,4 +23,4 @@ See [CHANGELOG.md](CHANGELOG.md) for release changes.
 
 ## Current version
 
-`0.2.7`
+`0.2.9`

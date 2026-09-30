@@ -52,7 +52,7 @@ export function createDestinationControls({request,reload,resource='all'}){
   await load();const problem=selectionProblem();if(problem){popup(problem);sync();return;}await setRemembered(true);reload();
  }
  el('fleet-toggle').addEventListener('click',()=>{el('fleet-panel').open=!el('fleet-panel').open;if(el('fleet-panel').open)void load();});
- document.addEventListener('click',event=>{const panel=el('fleet-panel'),toggle=el('fleet-toggle');if(panel.open&&!panel.contains(event.target)&&!toggle.contains(event.target))panel.open=false;});
+ document.addEventListener('click',event=>{const panel=el('fleet-panel'),toggle=el('fleet-toggle'),path=event.composedPath?.()||[];if(panel.open&&!path.includes(panel)&&!path.includes(toggle)&&!panel.contains(event.target)&&!toggle.contains(event.target))panel.open=false;});
  el('on').addEventListener('click',()=>void toggleSorting(true));el('off').addEventListener('click',()=>void toggleSorting(false));
  el('save').addEventListener('click',async()=>{await load();try{const problem=selectionProblem();if(problem)throw Error(problem);const name=el('preset-name').value.trim();if(!name)throw Error('Enter a preset name.');if(presets.some(row=>row.name===name))throw Error('A preset with that name already exists. Choose another name.');const saved={name,fleet:validateFleet(fleet)},oldLast=lastPreset;presets.push(saved);lastPreset=name;try{await persist();}catch(error){presets=presets.filter(row=>row!==saved);lastPreset=oldLast;throw error;}presetsUI();el('presets').value=name;status('Fleet preset saved.');}catch(error){popup(error.message);}});
  el('remove').addEventListener('click',async()=>{try{const name=el('presets').value;if(!name||!presets.some(row=>row.name===name))throw Error('Choose a saved preset to remove.');const old=presets,oldLast=lastPreset;presets=presets.filter(row=>row.name!==name);if(lastPreset===name)lastPreset='';try{await persist();}catch(error){presets=old;lastPreset=oldLast;throw error;}presetsUI();if(el('preset-name').value===name)el('preset-name').value='';status('Fleet preset removed.');}catch(error){popup(error.message);}});
@@ -60,7 +60,7 @@ export function createDestinationControls({request,reload,resource='all'}){
  presetsUI();sync();
  return {
   async setContext(next){if(context===next)return;context=next;catalog=null;snapshot=null;presets=[];lastPreset='';remembered=false;fleet=[];status('');presetsUI();sync();await load();if(preference().enabled)reload();},
-  selectResource(next){resource=next;sync();if(catalog)drawFleet();},
+  selectResource(next){const changed=resource!==next;resource=next;sync();if(changed&&catalog)drawFleet();},
   wantsOptimization(){return preference().enabled;},
   async prepare(){return load();},
   isEnabled(){return preference().enabled&&!selectionProblem();},

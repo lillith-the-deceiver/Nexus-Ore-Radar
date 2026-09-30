@@ -22,10 +22,15 @@ import {showToast,copySystemName,analyticsSyncLabel} from './desktop-feedback.js
 import {resourceTotals} from './resource-totals.js';
 import {createDestinationControls} from './destination-controls.js';
 import {breakdownRatesWithBaseline} from './destination-estimates.js';
+import {bindDashboardView} from './view-context.js';
+import {openTabSidePanel} from './open-side-panel.js';
 const loadedVersion=chrome.runtime.getManifest().version;
 const $=id=>document.getElementById(id),fmt=n=>n===null||n===undefined?'—':Math.round(n).toLocaleString();
 const request=async message=>{const r=await chrome.runtime.sendMessage(message);if(r?.error)throw Error(r.error);return r;};
 const guard=fn=>async()=>{try{$('error').textContent='';await fn();}catch(e){$('error').textContent=e.message;}};
+const requestedNexusTab=Number(new URL(location.href).searchParams.get('nexusTab'));
+const dashboardTabId=(await chrome.tabs.getCurrent())?.id;
+await bindDashboardView({chromeApi:chrome,documentApi:document,href:location.href,openFullView:guard(async()=>{const window=await chrome.windows.getCurrent();const [tab]=await chrome.tabs.query({active:true,windowId:window.id});return request({type:'OPEN_FULL_VIEW',windowId:window.id,nexusTabId:tab?.id});}),openSidePanel:guard(()=>openTabSidePanel(chrome,requestedNexusTab,dashboardTabId))});
 let previousSeasons='',currentContext='',period='total',records=[],analysis,scanState,showSeason=false,lastReportStamp=0,lastScanSignature='',lastRecordsSignature='',sent={},refreshing=false,refreshAgain=false;
 let missions=[],fuelQuotes=[],geometry={},markers=null;
 let cachedBelts=[],lastBeltsStamp='',lastCalendarStamp='';
