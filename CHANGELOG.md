@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.2 — 2026-10-02
+
+- Fixed switching between sidebar and full view so only one view remains open without interrupting an active scan.
+- Fixed the sidebar preference not being remembered after closing it with Chrome's X button.
+- Added safe GitHub update instructions that preserve the existing installation's setup and local data.
+
 ## 0.3.1 — 2026-10-01
 
 - Fixed active belt scans losing progress or results when Radar was hidden or Chrome restarted its background worker.

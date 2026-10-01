@@ -40,6 +40,9 @@ let scanPreparation=null;
 let activeScan=null;
 let scanFinalizing=false;
 let scanRecovery=null;
+let scanKeepAlive=null,scanKeepAliveId=null;
+let viewModeRevision=0;
+const tabModePanelCloses=new Set();
 let lifecycleReady=Promise.resolve();
 let updateMessages=0,updateUploads=0;
 const updateBusy=()=>!!(busy||missionBusy||quoteBusy||searchBusy||activeScan||scanFinalizing||updateMessages||updateUploads);
@@ -253,37 +256,40 @@ function ensureCaptureLoop(immediate=false,force=false){
   captureTimer?.unref?.();
 }
 function restartCaptureLoop(){stopCaptureLoop();ensureCaptureLoop(true,true);}
-void chrome.storage.local.get(VIEW_MODE_KEY).then(stored=>{
+const loadingViewModeRevision=viewModeRevision;
+void chrome.storage.local.get(VIEW_MODE_KEY).then(async stored=>{
+  if(loadingViewModeRevision!==viewModeRevision)return;
   viewMode=stored[VIEW_MODE_KEY]==='tab'?'tab':'side-panel';
+  await chrome.sidePanel.setPanelBehavior({openPanelOnActionClick:viewMode==='side-panel'});
 }).catch(()=>{});
 const rememberView=async mode=>{
+  viewModeRevision++;
   viewMode=mode;
-  await chrome.storage.local.set({[VIEW_MODE_KEY]:mode});
+  await Promise.all([
+    chrome.storage.local.set({[VIEW_MODE_KEY]:mode}),
+    chrome.sidePanel.setPanelBehavior({openPanelOnActionClick:mode==='side-panel'})
+  ]);
 };
 async function dashboard(windowId,nexusTabId) {
-  try{await chrome.sidePanel.close({tabId:nexusTabId});}catch{}
   const base=chrome.runtime.getURL('dashboard.html');
   const url=`${base}?view=tab&nexusTab=${nexusTabId}`;
   const tabs=await chrome.tabs.query({url:`${base}*`,windowId});
   if(tabs[0]) await chrome.tabs.update(tabs[0].id,{active:true,url}); else await chrome.tabs.create({url,windowId});
   await rememberView('tab');
+  // Once Chrome has activated the full view, close either representation it
+  // may still hold: the Nexus tab-specific panel or a window-level fallback.
+  // This changes presentation only; scan and capture state stay in the worker.
+  tabModePanelCloses.add(windowId);
+  const clearCloseMarker=setTimeout(()=>tabModePanelCloses.delete(windowId),1000);
+  clearCloseMarker?.unref?.();
+  for(const options of [{tabId:nexusTabId},{windowId}]){
+    try{await chrome.sidePanel.close(options);}catch{}
+  }
 }
 async function closeDashboardTabs(){
   const url=`${chrome.runtime.getURL('dashboard.html')}*`;
   const dashboards=await chrome.tabs.query({url});
   await Promise.all(dashboards.filter(candidate=>candidate.id!==undefined).map(candidate=>chrome.tabs.remove(candidate.id)));
-}
-async function openSidePanel(tab){
-  // Chrome requires sidePanel.open() to be called directly from the user
-  // gesture. Do not put any storage or tab work before this call.
-  const opening=chrome.sidePanel.open({tabId:tab.id});
-  await opening;
-  await closeDashboardTabs();
-  await rememberView('side-panel');
-}
-function openPreferredView(tab){
-  if(!isNexusUrl(tab?.url)||tab?.id===undefined)throw Error('Open Nexus before opening Radar.');
-  return viewMode==='tab'?dashboard(tab.windowId,tab.id):openSidePanel(tab);
 }
 async function activeContext() {
   const settings=await getSettings(), c=(await chrome.storage.session.get('connection')).connection;
@@ -326,6 +332,7 @@ function normalizedDestinationState(value){
  return {presets,lastPreset,remembered:state.remembered===true};
 }
 async function runScan(job,c){
+  startScanKeepAlive(job);
   const started=performance.now();
   const publish=async()=>{job.updatedAt=Date.now();Object.assign(job,scanTiming(job.done,job.total,(performance.now()-started)/1000,pacing.delay,performance.now()<pacing.holdUntil));await chrome.storage.session.set({scan:scanProgress(job)});};
   try{
@@ -377,8 +384,22 @@ async function runScan(job,c){
     const learnedDelay=pacing.finish();
     try{await chrome.storage.local.set({[SCAN_PACING_KEY]:learnedDelay});}catch{}
     job.running=false;scanFinalizing=true;if(activeScan===job)activeScan=null;
-    try{await deleteMetadata(c.context,SCAN_CHECKPOINT_KIND);await publish();}finally{scanFinalizing=false;releaseUpdate.check();}
+    try{await deleteMetadata(c.context,SCAN_CHECKPOINT_KIND);await publish();}finally{stopScanKeepAlive(job);scanFinalizing=false;releaseUpdate.check();}
   }
+}
+function startScanKeepAlive(job){
+ if(scanKeepAliveId===job.id)return;
+ if(scanKeepAlive!==null)clearInterval(scanKeepAlive);
+ scanKeepAliveId=job.id;
+ const beat=async()=>{try{await chrome.runtime.getPlatformInfo();}catch{}};
+ void beat();
+ scanKeepAlive=setInterval(beat,25000);
+ scanKeepAlive?.unref?.();
+}
+function stopScanKeepAlive(job){
+ if(scanKeepAliveId!==job.id)return;
+ if(scanKeepAlive!==null)clearInterval(scanKeepAlive);
+ scanKeepAlive=null;scanKeepAliveId=null;
 }
 function scanCheckpoint(job){
  return {version:1,id:job.id,context:job.context,queue:job.queue,total:job.total,startedAt:job.startedAt};
@@ -404,10 +425,20 @@ async function resumeInterruptedScan(){
  return scanRecovery;
 }
 void Promise.resolve(chrome.action.disable?.()).then(configureOpenNexusTabs).catch(()=>{});
-void chrome.sidePanel.setPanelBehavior({openPanelOnActionClick:false}).catch(()=>{});
-chrome.action.onClicked.addListener(tab=>{void openPreferredView(tab).catch(()=>{});});
+chrome.action.onClicked.addListener(tab=>{
+  // Chrome owns side-panel opening/toggling when that view is preferred.
+  // The custom action handler is used only for the remembered full-tab view.
+  if(viewMode==='tab'&&isNexusUrl(tab?.url)&&tab?.id!==undefined)void dashboard(tab.windowId,tab.id).catch(()=>{});
+});
 chrome.sidePanel.onOpened?.addListener(info=>{
   if(info.path===SIDE_PANEL_PATH&&info.tabId!==undefined)void closeDashboardTabs().then(()=>rememberView('side-panel')).catch(()=>{});
+});
+chrome.sidePanel.onClosed?.addListener(info=>{
+  if(info.path!==SIDE_PANEL_PATH)return;
+  // Ignore the close generated by switching to the full-tab view. A user
+  // closing the panel with Chrome's X keeps sidebar as their last-used mode.
+  if(tabModePanelCloses.delete(info.windowId))return;
+  void rememberView('side-panel').catch(()=>{});
 });
 chrome.tabs.onUpdated?.addListener((tabId,changeInfo,tab)=>{
   if(changeInfo.url||changeInfo.status==='loading')void configureSidePanelTab({...tab,id:tabId}).catch(()=>{});
