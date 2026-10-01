@@ -17,7 +17,7 @@ import {RequestPacing,detailWithRetries} from './request-pacing.js';
 import {runScanQueue} from './scan-scheduler.js';
 import {retryUnavailable} from './scan-availability.js';
 import {manualMarkerStore} from './manual-markers.js';
-import {saveFieldIndex,visibleSystemsFor,commitExactBeltCache,mapDataFor,saveMapData,metadataFor,saveMetadata} from './db.js';
+import {saveFieldIndex,visibleSystemsFor,commitExactBeltCache,mapDataFor,saveMapData,metadataFor,saveMetadata,deleteMetadata,completedScanSystemIds} from './db.js';
 import {scanProgress} from './scan-progress.js';
 import {deferredUpdate,refreshUpdatedDashboards} from './release-updates.js';
 import {reportsAfterFirstUse,reportBaselineKey} from './report-baseline.js';
@@ -27,6 +27,7 @@ const pacing=new RequestPacing();
 const manualMarkers=manualMarkerStore(chrome.storage.local);
 const REPORT_CAPTURE_MS=6000;
 const SCAN_PACING_KEY='learnedScanDelayMs';
+const SCAN_CHECKPOINT_KIND='active-scan';
 const SIDE_PANEL_PATH='dashboard.html?view=side-panel';
 const VIEW_MODE_KEY='radarViewMode';
 let viewMode='side-panel';
@@ -38,6 +39,7 @@ let searchBusy=false;
 let scanPreparation=null;
 let activeScan=null;
 let scanFinalizing=false;
+let scanRecovery=null;
 let lifecycleReady=Promise.resolve();
 let updateMessages=0,updateUploads=0;
 const updateBusy=()=>!!(busy||missionBusy||quoteBusy||searchBusy||activeScan||scanFinalizing||updateMessages||updateUploads);
@@ -61,7 +63,11 @@ const isNexusUrl=url=>{
 async function configureSidePanelTab(tab){
   if(tab?.id===undefined)return;
   const enabled=isNexusUrl(tab.url);
-  await chrome.sidePanel.setOptions(enabled?{tabId:tab.id,path:SIDE_PANEL_PATH,enabled:true}:{tabId:tab.id,enabled:false});
+  const desired=enabled?{tabId:tab.id,path:SIDE_PANEL_PATH,enabled:true}:{tabId:tab.id,enabled:false};
+  let current;
+  try{current=await chrome.sidePanel.getOptions?.({tabId:tab.id});}catch{}
+  const configured=enabled?current?.path===SIDE_PANEL_PATH&&current?.enabled!==false:current?.enabled===false;
+  if(!configured)await chrome.sidePanel.setOptions(desired);
   if(enabled)await chrome.action.enable?.(tab.id);else await chrome.action.disable?.(tab.id);
 }
 async function attachContentBridge(tab){
@@ -235,6 +241,7 @@ async function captureTick(force=false){
     const origin=seasonOrigin(settings.origin);
     if(!(await matchingTabs(origin)).length)return;
     keepRunning=true;
+    await resumeInterruptedScan();
     await pollOperations(force);
   }catch{}
   finally{if(keepRunning)ensureCaptureLoop(false);}
@@ -320,7 +327,7 @@ function normalizedDestinationState(value){
 }
 async function runScan(job,c){
   const started=performance.now();
-  const publish=async()=>{job.updatedAt=Date.now();Object.assign(job,scanTiming(job.done,job.queue.length,(performance.now()-started)/1000,pacing.delay,performance.now()<pacing.holdUntil));await chrome.storage.session.set({scan:scanProgress(job)});};
+  const publish=async()=>{job.updatedAt=Date.now();Object.assign(job,scanTiming(job.done,job.total,(performance.now()-started)/1000,pacing.delay,performance.now()<pacing.holdUntil));await chrome.storage.session.set({scan:scanProgress(job)});};
   try{
     const storedPacing=(await chrome.storage.local.get(SCAN_PACING_KEY))[SCAN_PACING_KEY];
     pacing.reset(storedPacing);
@@ -364,14 +371,37 @@ async function runScan(job,c){
         job.done++;await publish();
       }
     });
-    if(!job.cancelled&&!job.contextChanged&&!job.needsGameAuth&&!job.failedCount&&job.done===job.queue.length){await commitExactBeltCache(c.context,job.id);await beltsChanged(c.context);}
+    if(!job.cancelled&&!job.contextChanged&&!job.needsGameAuth&&!job.failedCount&&job.done===job.total){await commitExactBeltCache(c.context,job.id);await beltsChanged(c.context);}
   }catch(e){job.error=e.message;}
   finally{
     const learnedDelay=pacing.finish();
     try{await chrome.storage.local.set({[SCAN_PACING_KEY]:learnedDelay});}catch{}
     job.running=false;scanFinalizing=true;if(activeScan===job)activeScan=null;
-    try{await publish();}finally{scanFinalizing=false;releaseUpdate.check();}
+    try{await deleteMetadata(c.context,SCAN_CHECKPOINT_KIND);await publish();}finally{scanFinalizing=false;releaseUpdate.check();}
   }
+}
+function scanCheckpoint(job){
+ return {version:1,id:job.id,context:job.context,queue:job.queue,total:job.total,startedAt:job.startedAt};
+}
+async function resumeInterruptedScan(){
+ if(activeScan||searchBusy||scanFinalizing)return activeScan;
+ if(scanRecovery)return scanRecovery;
+ scanRecovery=(async()=>{
+   const c=await activeContext();
+   const checkpoint=await metadataFor(c.context,SCAN_CHECKPOINT_KIND);
+   if(!checkpoint||checkpoint.version!==1||checkpoint.context!==c.context||!Array.isArray(checkpoint.queue))return null;
+   const completed=new Set(await completedScanSystemIds(c.context,checkpoint.id));
+   const queue=checkpoint.queue.filter(system=>!completed.has(String(system.id)));
+   const total=Number.isSafeInteger(checkpoint.total)?checkpoint.total:checkpoint.queue.length;
+   const job={id:checkpoint.id,context:c.context,queue,done:Math.max(0,total-queue.length),total,running:queue.length>0,startedAt:checkpoint.startedAt||Date.now(),resumed:true};
+   if(!job.running){
+     await commitExactBeltCache(c.context,job.id);await deleteMetadata(c.context,SCAN_CHECKPOINT_KIND);await beltsChanged(c.context);await chrome.storage.session.set({scan:scanProgress(job)});return null;
+   }
+   activeScan=job;await chrome.storage.session.set({scan:scanProgress(job)});
+   void runScan(job,c).catch(()=>{if(activeScan===job)activeScan=null;});
+   return job;
+ })().catch(()=>null).finally(()=>{scanRecovery=null;});
+ return scanRecovery;
 }
 void Promise.resolve(chrome.action.disable?.()).then(configureOpenNexusTabs).catch(()=>{});
 void chrome.sidePanel.setPanelBehavior({openPanelOnActionClick:false}).catch(()=>{});
@@ -382,6 +412,9 @@ chrome.sidePanel.onOpened?.addListener(info=>{
 chrome.tabs.onUpdated?.addListener((tabId,changeInfo,tab)=>{
   if(changeInfo.url||changeInfo.status==='loading')void configureSidePanelTab({...tab,id:tabId}).catch(()=>{});
   if(changeInfo.status==='complete')void attachContentBridge({...tab,id:tabId}).catch(()=>{});
+});
+chrome.tabs.onActivated?.addListener(({tabId})=>{
+  void chrome.tabs.get(tabId).then(configureSidePanelTab).catch(()=>{});
 });
 chrome.runtime.onInstalled.addListener(details=>{
   lifecycleReady=resetExtensionDataForUpdate().then(()=>{chrome.alarms.create('capture',{periodInMinutes:.5});ensureCaptureLoop(true);void configureOpenNexusTabs();return refreshUpdatedDashboards(chrome,details);});
@@ -397,12 +430,12 @@ chrome.runtime.onMessage.addListener((msg,sender,respond)=>{
   if(msg?.type==='GAME_PULSE') {
     if(!sender.tab?.url) return;
     void configureSidePanelTab(sender.tab).catch(()=>{});
-    lifecycleReady.then(()=>getSettings()).then(s=>{try{if(seasonOrigin(sender.tab.url)===s.origin)ensureCaptureLoop(true);}catch{}}).then(()=>respond({ok:true}),()=>respond({ok:false}));
+    lifecycleReady.then(()=>getSettings()).then(s=>{try{if(seasonOrigin(sender.tab.url)===s.origin){ensureCaptureLoop(true);void resumeInterruptedScan();}}catch{}}).then(()=>respond({ok:true}),()=>respond({ok:false}));
     return true;
   }
   if(msg?.type==='RADAR_PULSE') {
     if(!ui)return;
-    lifecycleReady.then(()=>{ensureCaptureLoop(true);return true;}).then(()=>respond({ok:true}),()=>respond({ok:false}));
+    lifecycleReady.then(()=>{ensureCaptureLoop(true);void resumeInterruptedScan();return true;}).then(()=>respond({ok:true}),()=>respond({ok:false}));
     return true;
   }
   if(!ui) return;
@@ -418,10 +451,11 @@ chrome.runtime.onMessage.addListener((msg,sender,respond)=>{
       await dashboard(windowId,nexusTabId);return {ok:true};
     }
     if(msg.type==='STATE') {
+      await resumeInterruptedScan();
       const seasons=SEASONS;
       const state=await chrome.storage.session.get(['status','connection','scan','missionMarkers','fuelUpdatedAt','analyticsRevision','beltsRevision']);
       if(state.scan?.running&&!activeScan&&!searchBusy&&!scanFinalizing){
-        state.scan={...state.scan,running:false,cancelled:true,error:'Scan stopped when the extension worker stopped.'};
+        state.scan={...state.scan,running:false,cancelled:true,error:'Scan recovery data was unavailable.'};
         await chrome.storage.session.set({scan:state.scan});
       }
       const scan=scanProgress(state.scan);
@@ -478,7 +512,8 @@ chrome.runtime.onMessage.addListener((msg,sender,respond)=>{
         const queue=candidates(saved.map,index,msg.originId,Number(msg.radius),{examples:await searchExamplesFor(c.context),sent:await manualMarkers.get(c.context)});
         const updatedMap={...saved,map:indexSystems(list(saved.map,'systems'),normalizedFieldIndex(index))};
         await saveMapData(c.context,updatedMap);
-        const job={id:crypto.randomUUID(),context:c.context,queue,done:0,running:queue.length>0,startedAt:Date.now()};
+        const job={id:crypto.randomUUID(),context:c.context,queue,done:0,total:queue.length,running:queue.length>0,startedAt:Date.now()};
+        if(job.running)await saveMetadata(c.context,SCAN_CHECKPOINT_KIND,scanCheckpoint(job));
         await chrome.storage.session.set({scan:scanProgress(job)});
         if(job.running){activeScan=job;void runScan(job,c).catch(()=>{if(activeScan===job)activeScan=null;});}
         else{await commitExactBeltCache(c.context,job.id);await beltsChanged(c.context);}
@@ -488,7 +523,7 @@ chrome.runtime.onMessage.addListener((msg,sender,respond)=>{
     // Compatibility for a dashboard loaded before this worker update. It no
     // longer advances the queue; the background scheduler owns scan progress.
     if(msg.type==='SCAN_STEP')return {ok:true};
-    if(msg.type==='CANCEL_SCAN'){if(scanPreparation)scanPreparation.cancelled=true;const job=activeScan||(await chrome.storage.session.get('scan')).scan;if(job){job.running=!!activeScan;job.cancelled=true;await chrome.storage.session.set({scan:scanProgress(job)});}return {ok:true};}
+    if(msg.type==='CANCEL_SCAN'){if(scanPreparation)scanPreparation.cancelled=true;const job=activeScan||(await chrome.storage.session.get('scan')).scan;if(job){job.running=!!activeScan;job.cancelled=true;await chrome.storage.session.set({scan:scanProgress(job)});}try{const c=await activeContext();await deleteMetadata(c.context,SCAN_CHECKPOINT_KIND);}catch{}return {ok:true};}
     throw Error('Unsupported action');
   })().then(respond,error=>respond({error:error.message})).finally(()=>{updateMessages--;releaseUpdate.check();});return true;
 });

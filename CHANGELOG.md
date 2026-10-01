@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.1 — 2026-10-01
+
+- Fixed active belt scans losing progress or results when Radar was hidden or Chrome restarted its background worker.
+- Fixed the tab-specific sidebar failing to return when the Nexus tab was focused again.
+
 ## 0.3.0 — 2026-10-01
 
 - Fixed missed mining reports and unintended analytics loss after extension updates or long sessions.

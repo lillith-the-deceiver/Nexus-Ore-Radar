@@ -2,5 +2,5 @@
 export function scanProgress(job){
  if(!job)return null;
  const {queue,results,...progress}=job;
- return {...progress,total:queue?.length??progress.total??0};
+ return {...progress,total:progress.total??queue?.length??0};
 }

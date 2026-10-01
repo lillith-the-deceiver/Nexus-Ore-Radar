@@ -15,6 +15,9 @@ export async function metadataFor(context,kind){
 export async function saveMetadata(context,kind,value){
  const db=await database();return new Promise((resolve,reject)=>{const tx=db.transaction('metadata','readwrite');tx.objectStore('metadata').put({key:JSON.stringify([context,kind]),context,kind,value});tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error);tx.onabort=()=>reject(tx.error||Error('Could not save Radar data'));});
 }
+export async function deleteMetadata(context,kind){
+ const db=await database();return new Promise((resolve,reject)=>{const tx=db.transaction('metadata','readwrite');tx.objectStore('metadata').delete(JSON.stringify([context,kind]));tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error);tx.onabort=()=>reject(tx.error||Error('Could not remove Radar data'));});
+}
 export async function mapDataFor(context){
  const db=await database();return new Promise((resolve,reject)=>{
   const q=db.transaction('metadata','readonly').objectStore('metadata').get(JSON.stringify([context,'galaxy-map']));
@@ -59,6 +62,14 @@ export async function cachedSystemsFor(context){
     const q=db.transaction('metadata').objectStore('metadata').index('contextKind').getAll([context,'system-detail']);
     q.onsuccess=()=>resolve(q.result.map(r=>r.value));q.onerror=()=>reject(q.error);
   });
+}
+export async function completedScanSystemIds(context,runId){
+ const db=await database();return new Promise((resolve,reject)=>{
+  const tx=db.transaction('metadata','readonly'),ids=[];
+  const q=tx.objectStore('metadata').index('contextKind').openCursor([context,'field-inventory']);
+  q.onsuccess=()=>{const cursor=q.result;if(!cursor)return;const value=cursor.value.value;if(value?.runId===runId)ids.push(String(value.systemId));cursor.continue();};
+  tx.oncomplete=()=>resolve(ids);tx.onerror=()=>reject(tx.error);tx.onabort=()=>reject(tx.error||Error('Could not recover scan progress'));
+ });
 }
 export async function recordSearchOutcome(context,runId,system,belts,rawInventory){
   const db=await database();await new Promise((resolve,reject)=>{
