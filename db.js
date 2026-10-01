@@ -31,12 +31,12 @@ export async function saveMapData(context,value,fieldMarkers){
   tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error);tx.onabort=()=>reject(tx.error||Error('Could not save galaxy map'));
  });
 }
-export async function clearExactBeltCache(context){
+export async function commitExactBeltCache(context,runId){
  const db=await database();return new Promise((resolve,reject)=>{
   const tx=db.transaction('metadata','readwrite');
   const q=tx.objectStore('metadata').index('contextKind').openCursor([context,'system-detail']);
-  q.onsuccess=()=>{const cursor=q.result;if(!cursor)return;cursor.delete();cursor.continue();};
-  tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error);tx.onabort=()=>reject(tx.error||Error('Could not clear exact belt cache'));
+  q.onsuccess=()=>{const cursor=q.result;if(!cursor)return;if(cursor.value.value?.runId!==runId)cursor.delete();cursor.continue();};
+  tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error);tx.onabort=()=>reject(tx.error||Error('Could not commit exact belt cache'));
  });
 }
 export async function saveFieldIndex(context,entries){
@@ -69,7 +69,7 @@ export async function recordSearchOutcome(context,runId,system,belts,rawInventor
       store.put({key:inventoryKey,context,kind:'field-inventory',value:{runId,systemId:system.id,observedAt:now,inventoryConfirmed:explicitInventory(rawInventory),rawInventory,belts}});
       // Replace the current inventory, including confirmed empty inventories.
       // Prior observations remain intact in field-inventory history.
-      store.put({key:JSON.stringify([context,'system-detail',String(system.id)]),context,kind:'system-detail',value:{id:system.id,name:system.name,x:system.x,y:system.y,securityZone:system.securityZone??system.security_zone??'sentinel',belts,verifiedAt:now}});
+      store.put({key:JSON.stringify([context,'system-detail',String(system.id)]),context,kind:'system-detail',value:{id:system.id,name:system.name,x:system.x,y:system.y,securityZone:system.securityZone??system.security_zone??'sentinel',belts,verifiedAt:now,runId}});
       for(const feature of system._candidate_features||[]){
         const fields=belts.filter(b=>b.type===feature.field_type);
         const value={...feature,system_id:system.id,best_full_richness:Math.max(0,...fields.filter(b=>b.remaining>=100).map(b=>b.richness)),best_any_richness:Math.max(0,...fields.map(b=>b.richness)),observed_at:now};
@@ -107,13 +107,6 @@ function database() {
     req.onsuccess=()=>{req.result.onversionchange=()=>{req.result.close();opening=undefined;};resolve(req.result);}; req.onerror=()=>{opening=undefined;reject(req.error);};
   });
   return opening;
-}
-export async function clearExtensionDatabase(){
-  if(opening){const db=await opening;db.close();opening=undefined;}
-  return new Promise((resolve,reject)=>{
-    const request=indexedDB.deleteDatabase(DATABASE_NAME);
-    request.onsuccess=()=>resolve();request.onerror=()=>reject(request.error);request.onblocked=()=>reject(Error('Radar storage is still open. Close other Radar tabs and reload the extension.'));
-  });
 }
 export async function saveMissions(context,missions,systems=[]){
  const db=await database();return new Promise((resolve,reject)=>{

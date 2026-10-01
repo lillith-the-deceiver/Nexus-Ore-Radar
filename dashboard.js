@@ -37,7 +37,8 @@ let cachedBelts=[],lastBeltsStamp='',lastCalendarStamp='';
 let scanStarting=false,scanStopping=false;
 let nextBeltReadAt=0,lastBeltScanId='';
 let progressFailures=0,progressRetryAt=0;
-let exactUpdatedAt=0;
+let exactUpdatedAt=0,lastCapturePulse=0;
+const pulseCapture=()=>chrome.runtime.sendMessage({type:'RADAR_PULSE'}).catch(()=>{});
 let analyticsCache=new Map(),searchRenderGeneration=0;
 const renderSection=sectionRenderer();
 const prefKey=()=>`ui:${currentContext}`;
@@ -255,5 +256,6 @@ $('cancel-scan').onclick=guard(async()=>{
 chrome.storage.onChanged.addListener(()=>refresh().catch(()=>{}));
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)refresh().catch(e=>{$('error').textContent=e.message;});});
 window.addEventListener('resize',()=>{if(currentContext)renderSearch();});
-async function tick(){try{if(scanState?.running)await refresh();if(analysis&&lastCalendarStamp!==calendarStamp(period))renderAnalytics();}catch(e){$('error').textContent=e.message;}finally{setTimeout(tick,500);}}
+window.addEventListener('pagehide',pulseCapture);
+async function tick(){try{const now=Date.now();if(now-lastCapturePulse>=2500){lastCapturePulse=now;void pulseCapture();}if(scanState?.running)await refresh();if(analysis&&lastCalendarStamp!==calendarStamp(period))renderAnalytics();}catch(e){$('error').textContent=e.message;}finally{setTimeout(tick,500);}}
 guard(refresh)();tick();

@@ -2,7 +2,10 @@
 (()=>{
 const allowed = new Set(['/api/auth/me','/api/fleet/reports','/api/fleet/mining-reports','/api/fleet/missions','/api/galaxy/map','/api/galaxy/field-index','/api/planets']);
 if (/^(s0|nf|beta)\.nexuslegacy\.space$/.test(location.hostname)) {
-  const marker='__nexusRadarBridge023';
+  // Bump this bridge revision whenever an update must replace the isolated
+  // script already attached to an open Nexus tab. Chrome does not reload that
+  // tab when an extension is updated.
+  const marker='__nexusRadarBridge030';
   if(globalThis[marker])return;
   globalThis[marker]=true;
   chrome.runtime.onMessage.addListener((message,sender,respond)=>{
@@ -20,7 +23,9 @@ if (/^(s0|nf|beta)\.nexuslegacy\.space$/.test(location.hostname)) {
     return true;
   });
   let timer;
-  const pulse=()=>{try{chrome.runtime.sendMessage({type:'GAME_PULSE'}).catch(()=>{clearInterval(timer);});}catch{clearInterval(timer);}};
+  // A transient worker restart must not permanently stop report capture.
+  // The next pulse wakes the replacement worker and resumes polling.
+  const pulse=()=>{try{chrome.runtime.sendMessage({type:'GAME_PULSE'}).catch(()=>{});}catch{}};
   timer=setInterval(pulse,2500);pulse();
 }
 })();

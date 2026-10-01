@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.0 — 2026-10-01
+
+- Fixed missed mining reports and unintended analytics loss after extension updates or long sessions.
+- Fixed stalled and failed belt updates during temporary Nexus reloads while preserving prior results.
+- Restored Personal App scan pacing and candidate priority behavior.
+
 ## 0.2.9 — 2026-09-30
 
 - Added a Chrome side-panel view that is available only on Nexus Legacy tabs.

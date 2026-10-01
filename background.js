@@ -15,8 +15,9 @@ import {lastExactUpdate} from './belt-cache.js';
 import {pumpContributions} from './upload-worker.js';
 import {RequestPacing,detailWithRetries} from './request-pacing.js';
 import {runScanQueue} from './scan-scheduler.js';
+import {retryUnavailable} from './scan-availability.js';
 import {manualMarkerStore} from './manual-markers.js';
-import {saveFieldIndex,visibleSystemsFor,clearExactBeltCache,mapDataFor,saveMapData,clearExtensionDatabase,metadataFor,saveMetadata} from './db.js';
+import {saveFieldIndex,visibleSystemsFor,commitExactBeltCache,mapDataFor,saveMapData,metadataFor,saveMetadata} from './db.js';
 import {scanProgress} from './scan-progress.js';
 import {deferredUpdate,refreshUpdatedDashboards} from './release-updates.js';
 import {reportsAfterFirstUse,reportBaselineKey} from './report-baseline.js';
@@ -25,6 +26,7 @@ import {REFRESH_MS,shipSnapshot,destinationCatalog,validateFleet} from './destin
 const pacing=new RequestPacing();
 const manualMarkers=manualMarkerStore(chrome.storage.local);
 const REPORT_CAPTURE_MS=6000;
+const SCAN_PACING_KEY='learnedScanDelayMs';
 const SIDE_PANEL_PATH='dashboard.html?view=side-panel';
 const VIEW_MODE_KEY='radarViewMode';
 let viewMode='side-panel';
@@ -35,9 +37,10 @@ const missionSnapshots=new Map();
 let searchBusy=false;
 let scanPreparation=null;
 let activeScan=null;
+let scanFinalizing=false;
 let lifecycleReady=Promise.resolve();
 let updateMessages=0,updateUploads=0;
-const updateBusy=()=>!!(busy||missionBusy||quoteBusy||searchBusy||activeScan||updateMessages||updateUploads);
+const updateBusy=()=>!!(busy||missionBusy||quoteBusy||searchBusy||activeScan||scanFinalizing||updateMessages||updateUploads);
 const releaseUpdate=deferredUpdate(updateBusy,()=>chrome.runtime.reload());
 chrome.runtime.onUpdateAvailable?.addListener(()=>releaseUpdate.available());
 const getSettings=async()=> (await chrome.storage.local.get('settings')).settings || {};
@@ -61,10 +64,18 @@ async function configureSidePanelTab(tab){
   await chrome.sidePanel.setOptions(enabled?{tabId:tab.id,path:SIDE_PANEL_PATH,enabled:true}:{tabId:tab.id,enabled:false});
   if(enabled)await chrome.action.enable?.(tab.id);else await chrome.action.disable?.(tab.id);
 }
+async function attachContentBridge(tab){
+  if(tab?.id===undefined||!isNexusUrl(tab.url))return false;
+  await chrome.scripting.executeScript({target:{tabId:tab.id},files:['content.js']});
+  return true;
+}
 async function configureOpenNexusTabs(){
   const found=new Map();
   for(const season of SEASONS)for(const tab of await matchingTabs(season.origin))found.set(tab.id,tab);
-  await Promise.all([...found.values()].map(configureSidePanelTab));
+  await Promise.all([...found.values()].flatMap(tab=>[
+    configureSidePanelTab(tab),
+    attachContentBridge(tab).catch(()=>false)
+  ]));
 }
 async function loadMapFor(c,force=false){
   const previous=await mapDataFor(c.context);
@@ -311,7 +322,8 @@ async function runScan(job,c){
   const started=performance.now();
   const publish=async()=>{job.updatedAt=Date.now();Object.assign(job,scanTiming(job.done,job.queue.length,(performance.now()-started)/1000,pacing.delay,performance.now()<pacing.holdUntil));await chrome.storage.session.set({scan:scanProgress(job)});};
   try{
-    pacing.reset();
+    const storedPacing=(await chrome.storage.local.get(SCAN_PACING_KEY))[SCAN_PACING_KEY];
+    pacing.reset(storedPacing);
     await publish();
     await runScanQueue(job.queue,{
       stopped:()=>job.cancelled||job.needsGameAuth||!!job.contextChanged,
@@ -322,11 +334,19 @@ async function runScan(job,c){
       check:async system=>{
         const phase=system._scan_pass===1?'remaining':'priority';
         if(job.phase!==phase){job.phase=phase;await publish();}
-        const result=await detailWithRetries(async()=>{
-          if(job.contextChanged)return {status:409,error:'Scan stopped.'};
-          try{return {status:200,data:await searchRead(c,`/api/galaxy/systems/${system.id}/planets?include=fields`,false)};}
-          catch(e){if(e.contextChanged){job.contextChanged=true;job.error=e.message;}return {status:e.status||0,error:e.message};}
-        },pacing);
+        const waitingMessage='Nexus is reloading. Waiting to resume this update…';
+        let waiting=false;
+        const result=await retryUnavailable(()=>detailWithRetries(async()=>{
+            if(job.contextChanged)return {status:409,error:'Scan stopped.'};
+            try{return {status:200,data:await searchRead(c,`/api/galaxy/systems/${system.id}/planets?include=fields`,false)};}
+            catch(e){if(e.contextChanged){job.contextChanged=true;job.error=e.message;}return {status:e.status||0,error:e.message};}
+          },pacing),{
+          stopped:()=>job.cancelled||job.needsGameAuth||!!job.contextChanged,
+          onWaiting:async()=>{waiting=true;job.waitingRequests=(job.waitingRequests||0)+1;job.waitingForNexus=true;job.error=waitingMessage;await publish();},
+          pause:async()=>pacing.backoff(0,false),
+          onReady:async()=>{if(!waiting)return;job.waitingRequests=Math.max(0,(job.waitingRequests||1)-1);if(!job.waitingRequests){job.waitingForNexus=false;if(job.error===waitingMessage)job.error='';}await publish();}
+        });
+        if(result.aborted)return {...result,ok:false};
         if(result.status!==200)return {...result,ok:false};
         return {...result,ok:true,belts:fields(result.data)};
       },
@@ -334,7 +354,7 @@ async function runScan(job,c){
         if((await activeContext()).context!==c.context){job.contextChanged=true;throw Error('Account or season changed; scan stopped.');}
         // Like the desktop, stop launching new work on cancellation but retain
         // valid results from requests already in flight in the same context.
-        if(job.contextChanged)return;
+        if(job.contextChanged||result.aborted)return;
         if(result.ok){
           const relinked=await recordSearchOutcome(c.context,job.id,system,result.belts,result.data);
           if(relinked)await analyticsChanged(c.context);
@@ -344,8 +364,14 @@ async function runScan(job,c){
         job.done++;await publish();
       }
     });
+    if(!job.cancelled&&!job.contextChanged&&!job.needsGameAuth&&!job.failedCount&&job.done===job.queue.length){await commitExactBeltCache(c.context,job.id);await beltsChanged(c.context);}
   }catch(e){job.error=e.message;}
-  finally{job.running=false;await publish();if(activeScan===job)activeScan=null;releaseUpdate.check();}
+  finally{
+    const learnedDelay=pacing.finish();
+    try{await chrome.storage.local.set({[SCAN_PACING_KEY]:learnedDelay});}catch{}
+    job.running=false;scanFinalizing=true;if(activeScan===job)activeScan=null;
+    try{await publish();}finally{scanFinalizing=false;releaseUpdate.check();}
+  }
 }
 void Promise.resolve(chrome.action.disable?.()).then(configureOpenNexusTabs).catch(()=>{});
 void chrome.sidePanel.setPanelBehavior({openPanelOnActionClick:false}).catch(()=>{});
@@ -355,9 +381,10 @@ chrome.sidePanel.onOpened?.addListener(info=>{
 });
 chrome.tabs.onUpdated?.addListener((tabId,changeInfo,tab)=>{
   if(changeInfo.url||changeInfo.status==='loading')void configureSidePanelTab({...tab,id:tabId}).catch(()=>{});
+  if(changeInfo.status==='complete')void attachContentBridge({...tab,id:tabId}).catch(()=>{});
 });
 chrome.runtime.onInstalled.addListener(details=>{
-  lifecycleReady=resetExtensionDataForUpdate(chrome,details,clearExtensionDatabase).then(()=>{chrome.alarms.create('capture',{periodInMinutes:.5});ensureCaptureLoop(true);void configureOpenNexusTabs();return refreshUpdatedDashboards(chrome,details);});
+  lifecycleReady=resetExtensionDataForUpdate().then(()=>{chrome.alarms.create('capture',{periodInMinutes:.5});ensureCaptureLoop(true);void configureOpenNexusTabs();return refreshUpdatedDashboards(chrome,details);});
   void lifecycleReady.catch(()=>{});
 });
 chrome.runtime.onStartup.addListener(()=>{chrome.alarms.create('capture',{periodInMinutes:.5});ensureCaptureLoop(true);void configureOpenNexusTabs();});
@@ -371,6 +398,11 @@ chrome.runtime.onMessage.addListener((msg,sender,respond)=>{
     if(!sender.tab?.url) return;
     void configureSidePanelTab(sender.tab).catch(()=>{});
     lifecycleReady.then(()=>getSettings()).then(s=>{try{if(seasonOrigin(sender.tab.url)===s.origin)ensureCaptureLoop(true);}catch{}}).then(()=>respond({ok:true}),()=>respond({ok:false}));
+    return true;
+  }
+  if(msg?.type==='RADAR_PULSE') {
+    if(!ui)return;
+    lifecycleReady.then(()=>{ensureCaptureLoop(true);return true;}).then(()=>respond({ok:true}),()=>respond({ok:false}));
     return true;
   }
   if(!ui) return;
@@ -388,13 +420,13 @@ chrome.runtime.onMessage.addListener((msg,sender,respond)=>{
     if(msg.type==='STATE') {
       const seasons=SEASONS;
       const state=await chrome.storage.session.get(['status','connection','scan','missionMarkers','fuelUpdatedAt','analyticsRevision','beltsRevision']);
-      if(state.scan?.running&&!activeScan&&!searchBusy){
+      if(state.scan?.running&&!activeScan&&!searchBusy&&!scanFinalizing){
         state.scan={...state.scan,running:false,cancelled:true,error:'Scan stopped when the extension worker stopped.'};
         await chrome.storage.session.set({scan:state.scan});
       }
       const scan=scanProgress(state.scan);
       const manualSent=state.connection?await manualMarkers.get(state.connection.context):{};
-      return {protocol:STATE_PROTOCOL,appVersion:chrome.runtime.getManifest?.().version,updateBusy:!!(busy||missionBusy||quoteBusy||searchBusy||activeScan||updateUploads),settings:await getSettings(),...state,scan,seasons,manualSent};
+      return {protocol:STATE_PROTOCOL,appVersion:chrome.runtime.getManifest?.().version,updateBusy:!!(busy||missionBusy||quoteBusy||searchBusy||activeScan||scanFinalizing||updateUploads),settings:await getSettings(),...state,scan,seasons,manualSent};
     }
     if(msg.type==='CONSENT') {
       if(activeScan)activeScan.contextChanged=true;
@@ -437,7 +469,7 @@ chrome.runtime.onMessage.addListener((msg,sender,respond)=>{
       }finally{searchBusy=false;}
     }
     if(msg.type==='START_SCAN'){
-      if(searchBusy||activeScan)throw Error('Search request already running.');searchBusy=true;
+      if(searchBusy||activeScan||scanFinalizing)throw Error('Search request already running.');searchBusy=true;
       const preparation={id:crypto.randomUUID(),cancelled:false};scanPreparation=preparation;
       try{const c=await activeContext();preparation.context=c.context;const validatePreparation=()=>{if(preparation.cancelled)throw Error('Update cancelled.');};let saved=await storedMapFor(c.context);
         if(!saved)saved=(await loadMapFor(c,true)).data;validatePreparation();
@@ -446,11 +478,10 @@ chrome.runtime.onMessage.addListener((msg,sender,respond)=>{
         const queue=candidates(saved.map,index,msg.originId,Number(msg.radius),{examples:await searchExamplesFor(c.context),sent:await manualMarkers.get(c.context)});
         const updatedMap={...saved,map:indexSystems(list(saved.map,'systems'),normalizedFieldIndex(index))};
         await saveMapData(c.context,updatedMap);
-        validatePreparation();await clearExactBeltCache(c.context);
-        await beltsChanged(c.context);
         const job={id:crypto.randomUUID(),context:c.context,queue,done:0,running:queue.length>0,startedAt:Date.now()};
         await chrome.storage.session.set({scan:scanProgress(job)});
         if(job.running){activeScan=job;void runScan(job,c).catch(()=>{if(activeScan===job)activeScan=null;});}
+        else{await commitExactBeltCache(c.context,job.id);await beltsChanged(c.context);}
         return {ok:true};
       }finally{if(scanPreparation===preparation)scanPreparation=null;searchBusy=false;}
     }

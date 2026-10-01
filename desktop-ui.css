@@ -49,10 +49,11 @@ button,input,select{font-family:Rajdhani,sans-serif;font-weight:600}input,select
 .side-panel #search-controls .grid-cols-12{grid-template-columns:1fr}
 .side-panel #search-controls .col-span-5,.side-panel #search-controls .col-span-7{grid-column:1/-1}
 .side-panel #search-controls .grid-cols-5{grid-template-columns:repeat(2,minmax(0,1fr))}
-.side-panel #data-controls{grid-template-columns:minmax(0,1fr) auto;gap:6px}
+.side-panel #data-controls{grid-template-columns:minmax(0,1fr) auto auto;gap:6px}
 .side-panel #data-radius-label{grid-column:1/-1;grid-row:1}
 .side-panel #data-radius-field{grid-column:1;grid-row:2;height:34px}
-.side-panel #data-controls #scan,.side-panel #data-controls #cancel-scan{grid-column:2;grid-row:2;height:34px}
+.side-panel #data-controls #scan{grid-column:2;grid-row:2;height:34px}
+.side-panel #data-controls #cancel-scan{grid-column:3;grid-row:2;height:34px}
 .side-panel #destination-fleet-panel{position:fixed;z-index:100;top:72px;right:8px;width:min(520px,calc(100vw - 16px));max-height:calc(100vh - 80px);margin:0;padding:10px;overflow-y:auto;box-shadow:0 20px 45px #000c}
 .side-panel #destination-fleet-panel section{margin-top:0;padding:0 0 8px}
 .side-panel #destination-fleet-panel h3{margin:7px 0 5px}

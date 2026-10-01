@@ -28,10 +28,14 @@ export function candidatePriorityScore(feature,minRichness,model){
   const uncertainty=Math.sqrt(Math.max(0,posterior*(1-posterior))/(effective+12));
   return round4(Math.max(0,Math.min(1,posterior-.75*uncertainty))*100+headroom*2);
 }
+export function candidateSystemMetrics(features,minRichness,model){
+  if(!features.length)return [0,0];
+  let miss=1,best=-Infinity,expected=0;
+  for(const f of features){const score=candidatePriorityScore(f,minRichness,model),probability=Math.max(0,Math.min(1,score/100));best=Math.max(best,score);miss*=1-probability;expected+=f.field_count_bucket*probability;}
+  return [round4((1-miss)*100+best/1000),round4(expected)];
+}
 export function candidateSystemPriority(features,minRichness,model){
-  if(!features.length)return 0;
-  let miss=1,best=-Infinity;for(const f of features){const score=candidatePriorityScore(f,minRichness,model);best=Math.max(best,score);miss*=1-Math.max(0,Math.min(1,score/100));}
-  return round4((1-miss)*100+best/1000);
+  return candidateSystemMetrics(features,minRichness,model)[0];
 }
 export function outcomeModel(examples,minRichness,minPct){
   const grouped=new Map();
@@ -45,9 +49,9 @@ export function rankDetailCandidates(systems,minRichness,minPct,criteria,model=n
     const strongest=[...features].sort((a,b)=>b.best_remaining_pct-a.best_remaining_pct||b.best_richness-a.best_richness||a.field_count_bucket-b.field_count_bucket)[0]||null;
     s._candidate_feature=strongest;s._candidate_features=features;
     s._priority_tier=s._sent_recheck||s.sent_at?0:criteria.min_pct>=100&&features.some(f=>f.best_remaining_pct>=100)?1:2;
-    s._priority_score=candidateSystemPriority(features.filter(f=>f.best_richness>=criteria.min_richness),criteria.min_richness,model);
+    [s._priority_score,s._priority_expected_belts]=candidateSystemMetrics(features.filter(f=>f.best_richness>=criteria.min_richness),criteria.min_richness,model);
     s._scan_pass=criteria.two_pass?(features.some(f=>f.best_remaining_pct>=100&&f.best_richness>=1)?0:1):0;
     s._update_criteria={min_richness:minRichness,min_pct:minPct};s._ranking_criteria={...criteria};return s;
   });
-  return ranked.sort((a,b)=>a._scan_pass-b._scan_pass||Math.floor(Math.max(0,a.distance||0)/20)-Math.floor(Math.max(0,b.distance||0)/20)||(a._priority_tier===0?0:1)-(b._priority_tier===0?0:1)||b._priority_score-a._priority_score||a._priority_tier-b._priority_tier||(a.distance||0)-(b.distance||0)||((a.system_name||'')<(b.system_name||'')?-1:(a.system_name||'')>(b.system_name||'')?1:0));
+  return ranked.sort((a,b)=>a._scan_pass-b._scan_pass||Math.floor(Math.max(0,a.distance||0)/20)-Math.floor(Math.max(0,b.distance||0)/20)||(a._priority_tier===0?0:1)-(b._priority_tier===0?0:1)||b._priority_expected_belts-a._priority_expected_belts||b._priority_score-a._priority_score||a._priority_tier-b._priority_tier||(a.distance||0)-(b.distance||0)||((a.system_name||'')<(b.system_name||'')?-1:(a.system_name||'')>(b.system_name||'')?1:0));
 }
