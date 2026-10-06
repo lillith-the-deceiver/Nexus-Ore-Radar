@@ -4,7 +4,7 @@ import {readReportFeeds} from './report-feeds.js';
 import {normalizedFieldIndex,indexSystems} from './field-index.js';
 import {refreshMapSnapshot} from './map-refresh.js';
 import {relinkMissionReports} from './db.js';
-import {captureReportFeeds,counts,reportsFor,saveMissions,missionsFor,leaseFuelQuote,saveFuelQuote,fuelQuotesFor,searchExamplesFor,recordSearchOutcome,cachedSystemsFor} from './db.js';
+import {captureReportFeeds,counts,reportsFor,saveMissions,missionsFor,missionRowsFor,leaseFuelQuote,saveFuelQuote,fuelQuotesFor,searchExamplesFor,recordSearchOutcome,cachedSystemsFor} from './db.js';
 import {quoteResult} from './fuel.js';
 import {decodeMissions,activeLinkedMiningSystems,activeLinkedMiningFields} from './missions.js';
 import {candidates,fields,list} from './search.js';
@@ -22,13 +22,18 @@ import {scanProgress} from './scan-progress.js';
 import {deferredUpdate,refreshUpdatedDashboards} from './release-updates.js';
 import {reportsAfterFirstUse,reportBaselineKey} from './report-baseline.js';
 import {resetExtensionDataForUpdate} from './update-reset.js';
-import {REFRESH_MS,shipSnapshot,destinationCatalog,validateFleet} from './destination-estimates.js';
+import {REFRESH_MS,shipSnapshot,destinationCatalog,validateFleet,cyclesLeft,breakdownRatesWithBaseline} from './destination-estimates.js';
+import {activeMiningMissions,currentMiningResults,missionSampleMatchesFieldTime,updateMiningFieldObservation} from './live-mining.js';
+import {analyze} from './analytics.js';
+import {ANALYTICS_DELAY_MS,ANALYTICS_PERIODS,normalizeAnalyticsState,markAnalyticsStateDirty,dueAnalyticsPeriods,shouldBuildAnalytics,committedAnalyticsState} from './analytics-snapshots.js';
 const pacing=new RequestPacing();
 const manualMarkers=manualMarkerStore(chrome.storage.local);
 const REPORT_CAPTURE_MS=6000;
 const SCAN_PACING_KEY='learnedScanDelayMs';
 const SCAN_CHECKPOINT_KIND='active-scan';
 const SIDE_PANEL_PATH='dashboard.html?view=side-panel';
+const ANALYTICS_SNAPSHOT_KIND='analytics-snapshots-v1';
+const ANALYTICS_ALARM='analytics-snapshot-batch';
 const VIEW_MODE_KEY='radarViewMode';
 let viewMode='side-panel';
 let busy=false,lastAttempt=0;
@@ -36,6 +41,9 @@ let missionBusy=false,quoteBusy=false,missionTask=null;
 let captureTimer=null;
 const missionSnapshots=new Map();
 let searchBusy=false;
+let liveMiningRefresh=null;
+const analyticsBuilds=new Map();
+const analyticsStateTasks=new Map();
 let scanPreparation=null;
 let activeScan=null;
 let scanFinalizing=false;
@@ -51,7 +59,12 @@ chrome.runtime.onUpdateAvailable?.addListener(()=>releaseUpdate.available());
 const getSettings=async()=> (await chrome.storage.local.get('settings')).settings || {};
 const putSettings=settings=>chrome.storage.local.set({settings});
 const setStatus=status=>chrome.storage.session.set({status:{...status,at:Date.now()}});
-const analyticsChanged=context=>chrome.storage.session.set({analyticsRevision:{context,value:crypto.randomUUID()}});
+async function withAnalyticsState(context,operation){const prior=analyticsStateTasks.get(context)||Promise.resolve(),task=prior.catch(()=>{}).then(operation);analyticsStateTasks.set(context,task);try{return await task;}finally{if(analyticsStateTasks.get(context)===task)analyticsStateTasks.delete(context);}}
+async function analyticsChanged(context){
+ await chrome.storage.session.set({analyticsRevision:{context,value:crypto.randomUUID()}});
+ const state=await withAnalyticsState(context,async()=>{const next=markAnalyticsStateDirty(await metadataFor(context,ANALYTICS_SNAPSHOT_KIND));await saveMetadata(context,ANALYTICS_SNAPSHOT_KIND,next);return next;});
+ if(Object.values(state.periods).some(row=>row.dirtyAt!==null))await chrome.alarms.create(ANALYTICS_ALARM,{when:Date.now()+ANALYTICS_DELAY_MS});
+}
 const beltsChanged=context=>chrome.storage.session.set({beltsRevision:{context,value:crypto.randomUUID()}});
 async function reportsSinceFirstUse(context,feeds){
   const key=reportBaselineKey(context),stored=(await chrome.storage.local.get(key))[key];
@@ -202,7 +215,8 @@ async function syncMissions(tab,origin,context,force=false){
       for(const s of await cachedSystemsFor(context))knownSystems.set(String(s.id),s);
       const {links,changed}=await saveMissions(context,missions,[...knownSystems.values()]);
       if(changed)await analyticsChanged(context);
-      await chrome.storage.session.set({missionMarkers:{context,activeSystemIds:activeLinkedMiningSystems(missions,links),activeFieldIds:activeLinkedMiningFields(missions,links),at:Date.now(),stale:false}});
+      const activeFieldMissions={};for(const mission of missions){const type=String(mission.missionType||'').trim().toLowerCase(),status=String(mission.status||'').trim().toLowerCase(),fieldId=links[String(mission.id)]?.fieldId;if(!['mine','mining'].includes(type)||['','completed','complete','cancelled','canceled','failed','expired'].includes(status)||fieldId===null||fieldId===undefined)continue;const cargo=mission.cargo&&typeof mission.cargo==='object'?mission.cargo:{};activeFieldMissions[String(fieldId)]={missionId:String(mission.id),status,cycleCount:Number(cargo._cyclesDone)||0};}
+      await chrome.storage.session.set({missionMarkers:{context,activeSystemIds:activeLinkedMiningSystems(missions,links),activeFieldIds:activeLinkedMiningFields(missions,links),activeFieldMissions,at:Date.now(),stale:false}});
       missionSnapshots.set(context,missions);
       void syncQuote(tab,origin,context,missions);
       return missions;
@@ -329,7 +343,43 @@ function normalizedDestinationState(value){
  if(state.presets!==undefined&&!Array.isArray(state.presets))throw Error('Saved fleet presets are invalid.');
  for(const row of state.presets||[]){const name=typeof row?.name==='string'?row.name.trim():'';if(!name||name.length>80||names.has(name))throw Error('Saved fleet presets are invalid.');names.add(name);presets.push({name,fleet:validateFleet(row.fleet)});}
  let lastPreset=typeof state.lastPreset==='string'?state.lastPreset.trim():'';if(lastPreset&&!names.has(lastPreset))lastPreset='';
- return {presets,lastPreset,remembered:state.remembered===true};
+ const modes=new Set(['distance','balanced','yield','fuel','fastest','net_hydrogen']),saved=String(state.mode||'');
+ const mode=modes.has(saved)?saved:(state.remembered===true?'balanced':'distance');
+ return {presets,lastPreset,mode,remembered:mode!=='distance'};
+}
+async function liveMiningInputs(c){
+ const [rows,cached,saved,state,storedObservations]=await Promise.all([missionRowsFor(c.context),cachedSystemsFor(c.context),storedMapFor(c.context),metadataFor(c.context,'destination-state'),metadataFor(c.context,'live-mining-observations')]);
+ const mapSystems=saved?.context===c.context?list(saved.map,'systems'):[],byId=new Map(mapSystems.map(system=>[String(system.id??system.system_id),{...system,belts:[]} ]));
+ for(const system of cached){const key=String(system.id??system.system_id),base=byId.get(key)||{};byId.set(key,{...base,...system,belts:system.belts||[]});}
+ const systems=[...byId.values()],missions=activeMiningMissions(rows,systems),active=new Set(missions.keys()),observations={};
+ for(const [fieldId,value] of Object.entries(storedObservations&&typeof storedObservations==='object'?storedObservations:{}))if(active.has(String(fieldId)))observations[String(fieldId)]=value;
+ return {systems,missions,observations,state:normalizedDestinationState(state)};
+}
+async function currentMiningSnapshot(c,origin={x:0,y:0}){
+ const input=await liveMiningInputs(c),preset=input.state.presets.find(row=>row.name===input.state.lastPreset),snapshot=preset?await destinationSnapshot(c).catch(()=>null):null,analytics=normalizeAnalyticsState(await metadataFor(c.context,ANALYTICS_SNAPSHOT_KIND)),rates=breakdownRatesWithBaseline(analytics.periods.total?.value?.mechanics?.breakdowns||[]);
+ return currentMiningResults({missions:input.missions,systems:input.systems,observations:input.observations,origin,presetName:preset?.name||'',cyclesFor:preset?(belt,resource)=>cyclesLeft(belt,resource,preset.fleet,snapshot,rates):null});
+}
+async function refreshCurrentMining(c,origin={x:0,y:0}){
+ if(liveMiningRefresh)return liveMiningRefresh;
+ liveMiningRefresh=(async()=>{
+  const input=await liveMiningInputs(c),missionsBySystem=new Map();
+  for(const [fieldId,mission] of input.missions){const key=String(mission.system_id);if(!missionsBySystem.has(key))missionsBySystem.set(key,[]);missionsBySystem.get(key).push([fieldId,mission]);}
+  const entries=[...missionsBySystem.entries()],observations={...input.observations},optimizerSnapshot=entries.length?await destinationSnapshot(c).catch(()=>null):null;let refreshed=0,failed=0;
+  for(let offset=0;offset<entries.length;offset+=6){await Promise.all(entries.slice(offset,offset+6).map(async([systemId,targets])=>{try{const body=payload(await searchRead(c,`/api/galaxy/systems/${encodeURIComponent(systemId)}/planets?include=fields`,false,false)),observed=fields(body),at=Math.trunc(Date.now()/1000);for(const [fieldId,mission] of targets){const field=observed.find(row=>String(row.id)===String(fieldId));if(field&&missionSampleMatchesFieldTime(mission,at))observations[String(fieldId)]=updateMiningFieldObservation(mission,field,observations[String(fieldId)],at,optimizerSnapshot);}refreshed++;}catch{failed++;}}));}
+  await saveMetadata(c.context,'live-mining-observations',observations);
+  const snapshot=await currentMiningSnapshot(c,origin);return {...snapshot,refreshed_systems:refreshed,failed_systems:failed};
+ })().finally(()=>{liveMiningRefresh=null;});return liveMiningRefresh;
+}
+async function buildAnalyticsSnapshot(c,period,now=Date.now()){
+ const [reports,missions,quotes,saved]=await Promise.all([reportsFor(c.context),missionsFor(c.context),fuelQuotesFor(c.context),storedMapFor(c.context)]),geometry=saved?.context===c.context?{systems:list(saved.map,'systems'),planets:list(saved.planets,'planets')}:{systems:[],planets:[]};
+ return analyze(reports,period,now,missions,quotes,geometry);
+}
+async function readAnalyticsSnapshot(c,period,{force=false}={}){
+ if(!ANALYTICS_PERIODS.includes(period))throw Error('Unknown analytics period.');const key=`${c.context}:${period}`;
+ let state=normalizeAnalyticsState(await metadataFor(c.context,ANALYTICS_SNAPSHOT_KIND)),now=Date.now();
+ if(!shouldBuildAnalytics(state,period,{now,force}))return {analysis:state.periods[period].value,version:state.periods[period].version,pending:state.periods[period].dirtyAt!==null};
+ if(analyticsBuilds.has(key))return analyticsBuilds.get(key);
+ const task=(async()=>{state=normalizeAnalyticsState(await metadataFor(c.context,ANALYTICS_SNAPSHOT_KIND));now=Date.now();if(!shouldBuildAnalytics(state,period,{now,force}))return {analysis:state.periods[period].value,version:state.periods[period].version,pending:state.periods[period].dirtyAt!==null};const startedGeneration=state.periods[period]?.generation||0,analysis=await buildAnalyticsSnapshot(c,period,now),committed=await withAnalyticsState(c.context,async()=>{const latest=normalizeAnalyticsState(await metadataFor(c.context,ANALYTICS_SNAPSHOT_KIND)),next=committedAnalyticsState(latest,period,analysis,{startedGeneration,now});await saveMetadata(c.context,ANALYTICS_SNAPSHOT_KIND,next);return next;});await chrome.storage.session.set({analyticsRevision:{context:c.context,value:crypto.randomUUID()}});const row=committed.periods[period];if(row.dirtyAt!==null)await chrome.alarms.create(ANALYTICS_ALARM,{when:row.dirtyAt+ANALYTICS_DELAY_MS});return {analysis:row.value,version:row.version,pending:row.dirtyAt!==null};})().finally(()=>analyticsBuilds.delete(key));analyticsBuilds.set(key,task);return task;
 }
 async function runScan(job,c){
   startScanKeepAlive(job);
@@ -454,7 +504,7 @@ chrome.runtime.onInstalled.addListener(details=>{
 chrome.runtime.onStartup.addListener(()=>{chrome.alarms.create('capture',{periodInMinutes:.5});ensureCaptureLoop(true);void configureOpenNexusTabs();});
 // Alarms are only a watchdog. The six-second extension worker loop owns the
 // normal capture cadence and an alarm restarts it if Chrome stopped the worker.
-chrome.alarms.onAlarm.addListener(a=>{if(a.name==='capture')ensureCaptureLoop(true);});
+chrome.alarms.onAlarm.addListener(a=>{if(a.name==='capture')ensureCaptureLoop(true);if(a.name===ANALYTICS_ALARM)void (async()=>{try{const c=await activeContext(),state=await metadataFor(c.context,ANALYTICS_SNAPSHOT_KIND);for(const period of dueAnalyticsPeriods(state))await readAnalyticsSnapshot(c,period);}catch{await chrome.alarms.create(ANALYTICS_ALARM,{when:Date.now()+30000});}})();});
 chrome.runtime.onMessage.addListener((msg,sender,respond)=>{
   if(sender.id!==chrome.runtime.id) return;
   const ui=sender.url?.split(/[?#]/,1)[0]===chrome.runtime.getURL('dashboard.html');
@@ -508,12 +558,17 @@ chrome.runtime.onMessage.addListener((msg,sender,respond)=>{
     }
     if(msg.type==='SYNC') {await pollOperations(true);ensureCaptureLoop(false);return {ok:true};}
     if(msg.type==='REPORTS'){const c=await activeContext(),saved=await storedMapFor(c.context);return {context:c.context,reports:await reportsFor(c.context),missions:await missionsFor(c.context),fuelQuotes:await fuelQuotesFor(c.context),geometry:saved?.context===c.context?{systems:list(saved.map,'systems'),planets:list(saved.planets,'planets')}:{systems:[],planets:[]}};}
+    if(msg.type==='ANALYTICS'){const c=await activeContext(),snapshot=await readAnalyticsSnapshot(c,String(msg.period||'total'),{force:msg.force===true});return {context:c.context,...snapshot};}
     if(msg.type==='DESTINATION_DATA'){
       const c=await activeContext(),snapshot=await destinationSnapshot(c),state=normalizedDestinationState(await metadataFor(c.context,'destination-state'));
       return {context:c.context,snapshot,catalog:destinationCatalog(snapshot),state};
     }
     if(msg.type==='SAVE_DESTINATION_STATE'){
       const c=await activeContext(),state=normalizedDestinationState(msg.state);await saveMetadata(c.context,'destination-state',state);return {context:c.context,state};
+    }
+    if(msg.type==='CURRENTLY_MINED'){
+      const c=await activeContext(),origin=msg.origin&&typeof msg.origin==='object'?{x:Number(msg.origin.x)||0,y:Number(msg.origin.y)||0}:{x:0,y:0};
+      return {context:c.context,...(msg.refresh===true?await refreshCurrentMining(c,origin):await currentMiningSnapshot(c,origin))};
     }
     if(msg.type==='BELTS'){const c=await activeContext(),saved=await storedMapFor(c.context);return {context:c.context,systems:await visibleSystemsFor(c.context),lastExactUpdate:lastExactUpdate(await cachedSystemsFor(c.context)),mapSystems:saved?.context===c.context?list(saved.map,'systems'):null};}
     if(msg.type==='SET_SENT'){

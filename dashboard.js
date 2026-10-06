@@ -1,11 +1,10 @@
 import {CONSENT_VERSION,hasConsent} from './core.js';
 import {bindGuide} from './guide.js';
 bindGuide();
-import {analyze} from './analytics.js';
 import {matches,distancesFrom} from './search.js';
 import {desktopSearch} from './desktop-search.js';
 import {renderDesktopHistory} from './desktop-history.js';
-import {renderDesktopResults,matchedColumnCount} from './desktop-results.js';
+import {renderDesktopResults,matchedColumnCount,updateLiveMiningCountdowns} from './desktop-results.js';
 import {desktopLocations,renderDesktopLocations} from './desktop-locations.js';
 import {saveLocation,syncPlanetLocations,locationOptionLabel} from './locations.js';
 import {compatibleState,connectedState,RELOAD_MESSAGE} from './connection-state.js';
@@ -40,6 +39,7 @@ let progressFailures=0,progressRetryAt=0;
 let exactUpdatedAt=0,lastCapturePulse=0;
 const pulseCapture=()=>chrome.runtime.sendMessage({type:'RADAR_PULSE'}).catch(()=>{});
 let analyticsCache=new Map(),searchRenderGeneration=0;
+let currentlyMinedView=false,currentMiningData=null,currentMiningInFlight=null,lastLiveMissionSignature='';
 const renderSection=sectionRenderer();
 const prefKey=()=>`ui:${currentContext}`;
 // Static, source-extracted desktop markup. Game data is never inserted as HTML.
@@ -48,7 +48,7 @@ document.body.insertAdjacentHTML('beforeend',desktopLocations);
 const destinationControls=createDestinationControls({request,resource:'all',reload:()=>renderSearch(true)});
 let preferences={},mapSystems=[],searchFilter={type:'all',zone:'all',richness:1.0001,remaining:100};
 let originsLoadedContext='',originsRefreshAttemptedContext='',nextOriginsAttempt=0;
-async function savePreferences(){await chrome.storage.local.set({[prefKey()]:{...preferences,filter:searchFilter,customRichness:$('custom-richness').value||'',radius:$('radius').value,origin:$('search-origin').value}});}
+async function savePreferences(){await chrome.storage.local.set({[prefKey()]:{...preferences,currentlyMinedView,filter:searchFilter,customRichness:$('custom-richness').value||'',radius:$('radius').value,origin:$('search-origin').value}});}
 function restoreHidden(){document.querySelectorAll('[data-hide]').forEach(b=>{const hidden=!!preferences.hidden?.[b.dataset.hide];$(b.dataset.hide).hidden=hidden;b.textContent=hidden?'Show':'Hide';b.setAttribute('aria-expanded',String(!hidden));});}
 function renderOrigins(){const selected=$('search-origin').value||preferences.origin;const options=(preferences.locations||[]).map(l=>new Option(locationOptionLabel(l),String(l.id)));$('search-origin').replaceChildren(...(options.length?options:[new Option('Add a saved location to calculate proximity','')]));$('search-origin').value=options.some(o=>o.value===selected)?selected:(options[0]?.value||'');preferences.origin=$('search-origin').value;}
 async function loadOrigins(){const context=currentContext,refresh=originsRefreshAttemptedContext!==context;originsRefreshAttemptedContext=context;const data=await request({type:'LOAD_MAP',refresh});if(context!==currentContext)return;mapSystems=data.systems;preferences.locations=syncPlanetLocations(preferences.locations||[],data.planets,data.systems);if(data.refreshError)$('error').textContent=data.refreshError;renderOrigins();await savePreferences();if(context!==currentContext)return;originsLoadedContext=context;nextOriginsAttempt=0;renderScanControls();renderSearch(true);}
@@ -107,7 +107,7 @@ async function refresh() {
     if(currentContext!==connection.context){
       currentContext=connection.context;lastReportStamp=0;records=[];missions=[];fuelQuotes=[];geometry={};lastScanSignature='';lastRecordsSignature='';analyticsCache=new Map();
       cachedBelts=[];mapSystems=[];lastBeltsStamp='';exactUpdatedAt=0;originsLoadedContext='';originsRefreshAttemptedContext='';nextOriginsAttempt=0;
-      preferences=(await chrome.storage.local.get(prefKey()))[prefKey()]||{};sent=preferences.sent||{};
+      preferences=(await chrome.storage.local.get(prefKey()))[prefKey()]||{};sent=preferences.sent||{};currentlyMinedView=preferences.currentlyMinedView===true;currentMiningData=null;currentMiningInFlight=null;lastLiveMissionSignature='';syncCurrentlyMinedButtons();
       searchFilter=preferences.filter||{type:'all',zone:'all',richness:1.0001,remaining:100};
       destinationControls.selectResource(searchFilter.type);
       $('custom-richness').value=preferences.customRichness||'';$('radius').value=preferences.radius||350;
@@ -120,6 +120,7 @@ async function refresh() {
       try{await loadOrigins();}catch(e){$('error').textContent=e.message;renderScanControls();}
     }
     markers=missionMarkers?.context===currentContext?missionMarkers:null;
+    const liveMissionSignature=JSON.stringify(markers?.activeFieldMissions||{});if(currentlyMinedView&&lastLiveMissionSignature&&liveMissionSignature!==lastLiveMissionSignature)void loadCurrentlyMinedBelts(true);lastLiveMissionSignature=liveMissionSignature;
     sent=state.manualSent||{};
     const reportStamp=analyticsStamp(currentContext,state);
     const previousScan=scanState;
@@ -130,18 +131,11 @@ async function refresh() {
     if(previousScan?.running&&previousScan.context===scanState?.context&&previousScan.id===scanState?.id&&!scanState.running){const outcome=scanOutcome(scanState);if(outcome?.toast)showToast(outcome.toast);}
   }finally{refreshing=false;if(refreshAgain){refreshAgain=false;queueMicrotask(()=>refresh().catch(()=>{}));}}
 }
-async function refreshAnalyticsData(stamp){
-  if(stamp===lastReportStamp)return;
-  const context=currentContext;
-  try{
-    const data=await request({type:'REPORTS'});
-    if(context!==currentContext||data.context!==context)return;
-    const signature=JSON.stringify([data.reports,data.missions,data.fuelQuotes,data.geometry]);
-    if(signature!==lastRecordsSignature){records=data.reports;missions=data.missions||[];fuelQuotes=data.fuelQuotes||[];geometry=data.geometry||{};lastRecordsSignature=signature;analyticsCache=new Map();prefetchAnalytics();renderAnalytics();renderSearch(true);}
-    lastReportStamp=stamp;
-  }catch(error){
-    if(context===currentContext){$('analytics-loading-state').textContent='Could not load analytics. Try again.';$('analytics-loading-state').classList.add('text-rose-300');}
-  }
+async function loadAnalyticsPeriod(selected,force=false){const context=currentContext,data=await request({type:'ANALYTICS',period:selected,force});if(context!==currentContext||data.context!==context)return null;analyticsCache.set(selected,data.analysis);return data;}
+async function refreshAnalyticsData(stamp,force=false){
+  if(!force&&stamp===lastReportStamp)return;const context=currentContext;
+  try{const selected=await loadAnalyticsPeriod(period,force);if(context!==currentContext||!selected)return;let lifetime=selected;if(period!=='total')lifetime=await loadAnalyticsPeriod('total',force);if(context!==currentContext)return;const signature=JSON.stringify([selected.version,lifetime?.version]);if(signature!==lastRecordsSignature){lastRecordsSignature=signature;renderAnalytics();renderSearch(true);}lastReportStamp=stamp;}
+  catch(error){if(context===currentContext){$('analytics-loading-state').textContent='Could not load analytics. Try again.';$('analytics-loading-state').classList.add('text-rose-300');}}
 }
 async function refreshBeltData(stamp){
   if(stamp===lastBeltsStamp)return;
@@ -157,9 +151,8 @@ async function refreshBeltData(stamp){
   }catch(error){if(context===currentContext)$('error').textContent=error.message;}
   finally{if(context===currentContext&&scanId&&lastBeltScanId===scanId)nextBeltReadAt=Date.now()+4000;}
 }
-function cachedAnalysis(selected,now=Date.now()){const key=`${currentContext}:${lastRecordsSignature}:${selected}:${calendarStamp(selected,now)}`;if(!analyticsCache.has(key))analyticsCache.set(key,analyze(records,selected,now,missions,fuelQuotes,geometry));return analyticsCache.get(key);}
-function prefetchAnalytics(){const now=Date.now();for(const selected of ['total','day','week'])cachedAnalysis(selected,now);}
-function renderAnalytics(){const now=Date.now();lastCalendarStamp=calendarStamp(period,now);analysis=cachedAnalysis(period,now);
+function cachedAnalysis(selected){return analyticsCache.get(selected)||null;}
+function renderAnalytics(){const now=Date.now();lastCalendarStamp=calendarStamp(period,now);analysis=cachedAnalysis(period);if(!analysis){$('analytics-loading-state').textContent='Calculating analytics…';return;}
   renderSection('summary',[analysis.runs,analysis.resources,analysis.averageDuration],()=>{$('runs').textContent=fmt(analysis.runs);$('resources').textContent=fmt(analysis.resources);$('duration').textContent=formatDuration(analysis.averageDuration);});
   renderSection('resources',analysis.totals,()=>{
   $('total-yields').replaceChildren(...resourceTotals(analysis.totals).map(({total,label})=>{const row=el('div',undefined,'value-row'),value=el('strong',fmt(total)+' ','green');value.append(el('span','total','font-normal text-slate-400'));row.append(el('span',label),value);return row;}));
@@ -185,6 +178,11 @@ function renderChart(){if(!analysis)return;
   renderDesktopHistory(analysis.yieldHistory);
 }
 function filter(){return searchFilter;}
+function syncCurrentlyMinedButtons(){$('currently-mined-show')?.setAttribute('aria-pressed',String(currentlyMinedView));$('currently-mined-hide')?.setAttribute('aria-pressed',String(!currentlyMinedView));}
+function currentMiningOrigin(){const selected=(preferences.locations||[]).find(location=>String(location.id)===$('search-origin').value),system=mapSystems.find(row=>String(row.id)===String(selected?.system_id));return {x:Number(system?.x)||0,y:Number(system?.y)||0};}
+function renderCurrentlyMinedResult(data){if(!currentlyMinedView||!data)return;currentMiningData=data;++searchRenderGeneration;$('match-count').textContent=`${data.total_systems||0} Systems · ${data.total_belts||0} Belts`;$('matches-empty').hidden=!!data.systems?.length;$('matches-empty').textContent='No active mining missions.';renderDesktopResults(data.systems||[],{copySystemName,setSystemSent:async(id,value)=>{try{const result=await request({type:'SET_SENT',systemId:id,sent:value});sent=result.manualSent;void loadCurrentlyMinedBelts(false);showToast(value?'Fleet marked as sent':'Fleet marker cleared');}catch(error){showToast(`Could not update fleet marker: ${error.message}`,true);}}});destinationControls.showResult(null);}
+async function loadCurrentlyMinedBelts(refresh=false){if(!currentlyMinedView||currentMiningInFlight)return currentMiningInFlight;const context=currentContext;currentMiningInFlight=(async()=>{try{const data=await request({type:'CURRENTLY_MINED',refresh,origin:currentMiningOrigin()});if(context!==currentContext||data.context!==context||!currentlyMinedView)return;renderCurrentlyMinedResult(data);}catch(error){if(context===currentContext)$('error').textContent=error.message;}finally{currentMiningInFlight=null;}})();return currentMiningInFlight;}
+async function setCurrentlyMinedView(show){currentlyMinedView=Boolean(show);syncCurrentlyMinedButtons();await savePreferences();if(!currentlyMinedView){currentMiningData=null;renderSearch(true);return;}await loadCurrentlyMinedBelts(false);void loadCurrentlyMinedBelts(true);}
 function renderSearch(force=false){
   renderScanControls();
   const outcome=scanOutcome(scanState);
@@ -192,6 +190,7 @@ function renderSearch(force=false){
   $('scan-status').classList.toggle('text-rose-400',!!outcome?.error);
   $('refresh-last-updated').textContent=exactUpdateLabel(exactUpdatedAt);
   if(!validDisplayFilter(filter()))return;
+  if(currentlyMinedView){if(currentMiningData)renderCurrentlyMinedResult(currentMiningData);else void loadCurrentlyMinedBelts(false);return;}
   const signature=JSON.stringify([lastBeltsStamp,filter(),sent,$('search-origin').value,markers?.activeSystemIds,markers?.activeFieldIds,markers?.stale,matchedColumnCount(),destinationControls.wantsOptimization(),lastRecordsSignature]);if(!force&&signature===lastScanSignature)return;lastScanSignature=signature;
   const selected=(preferences.locations||[]).find(l=>String(l.id)===$('search-origin').value);
   const results=matches(distancesFrom(cachedBelts,mapSystems,selected?.system_id),filter()),generation=++searchRenderGeneration;
@@ -203,7 +202,7 @@ function renderSearch(force=false){
   $('matches').querySelectorAll('[data-toggle-sent]').forEach(b=>{b.title=markers?.stale?'Mission sync delayed; showing last known state':automatic.has(b.dataset.toggleSent)?'Active mining fleet':sent[b.dataset.toggleSent]?'Click to clear manual marker':'Click to mark sent';});
   };
   if(!destinationControls.wantsOptimization()){destinationControls.showResult(null);render(results);return;}
-  void (async()=>{await destinationControls.prepare();if(generation!==searchRenderGeneration)return;if(!destinationControls.isEnabled()){render(results);return;}try{const lifetime=cachedAnalysis('total'),rates=breakdownRatesWithBaseline(lifetime.mechanics.breakdowns),optimized=destinationControls.optimize(results,rates);destinationControls.showResult(optimized.optimization);render(optimized.systems);}catch(error){destinationControls.showResult({message:error.message});render(results);}})();
+  void (async()=>{await destinationControls.prepare();if(generation!==searchRenderGeneration)return;if(!destinationControls.isEnabled()){render(results);return;}try{let lifetime=cachedAnalysis('total');if(!lifetime){await loadAnalyticsPeriod('total');lifetime=cachedAnalysis('total');}if(generation!==searchRenderGeneration)return;const rates=breakdownRatesWithBaseline(lifetime?.mechanics?.breakdowns||[]),optimized=destinationControls.optimize(results,rates);destinationControls.showResult(optimized.optimization);render(optimized.systems);}catch(error){destinationControls.showResult({message:error.message});render(results);}})();
 }
 function renderScanControls(){
   const updating=scanStarting||!!scanState?.running,stopping=scanStopping||!!(scanState?.running&&scanState?.cancelled);
@@ -217,10 +216,10 @@ $('connect').onclick=guard(async()=>{const b=$('connect');b.disabled=true;b.text
 $('change-season').onclick=()=>{showSeason=!showSeason;$('season-panel').hidden=!showSeason;$('destination-fleet-toggle').hidden=showSeason;if(showSeason)$('destination-fleet-panel').open=false;};
 $('sync').onclick=guard(async()=>{
  const button=$('sync');button.disabled=true;button.textContent='Syncing…';$('analytics-body').setAttribute('aria-busy','true');
- try{await request({type:'SYNC'});await refresh();}
+ try{await request({type:'SYNC'});await refreshAnalyticsData(`${Date.now()}`,true);await refresh();}
  finally{button.disabled=false;button.textContent='Sync';$('analytics-body').removeAttribute('aria-busy');}
 });
-document.querySelectorAll('[data-hide]').forEach(b=>{b.setAttribute('aria-controls',b.dataset.hide);b.setAttribute('aria-expanded','true');b.onclick=guard(async()=>{preferences.hidden={...preferences.hidden,[b.dataset.hide]:!$(b.dataset.hide).hidden};restoreHidden();if(b.dataset.hide==='history-body'&&!$('history-body').hidden)renderChart();if(['matched-body','search-body'].includes(b.dataset.hide)&&!$(b.dataset.hide).hidden)renderSearch(true);await savePreferences();});});document.querySelectorAll('[data-period]').forEach(b=>b.onclick=()=>{period=b.dataset.period;document.querySelectorAll('[data-period]').forEach(x=>x.classList.toggle('selected',x===b));renderAnalytics();});let chartWidth=0;new ResizeObserver(entries=>{const width=entries[0].contentRect.width;if(width>0&&Math.abs(width-chartWidth)>1){chartWidth=width;renderChart();}}).observe($('history-charts'));
+document.querySelectorAll('[data-hide]').forEach(b=>{b.setAttribute('aria-controls',b.dataset.hide);b.setAttribute('aria-expanded','true');b.onclick=guard(async()=>{preferences.hidden={...preferences.hidden,[b.dataset.hide]:!$(b.dataset.hide).hidden};restoreHidden();if(b.dataset.hide==='history-body'&&!$('history-body').hidden)renderChart();if(['matched-body','search-body'].includes(b.dataset.hide)&&!$(b.dataset.hide).hidden)renderSearch(true);await savePreferences();});});document.querySelectorAll('[data-period]').forEach(b=>b.onclick=guard(async()=>{period=b.dataset.period;document.querySelectorAll('[data-period]').forEach(x=>x.classList.toggle('selected',x===b));if(!cachedAnalysis(period))await loadAnalyticsPeriod(period);renderAnalytics();}));let chartWidth=0;new ResizeObserver(entries=>{const width=entries[0].contentRect.width;if(width>0&&Math.abs(width-chartWidth)>1){chartWidth=width;renderChart();}}).observe($('history-charts'));
 function updateFilterButtons(){updateSearchButtons(document,searchFilter,$('custom-richness').value!=='');}
 document.querySelectorAll('[data-onclick]').forEach(b=>{
  const action=b.dataset.onclick,match=action.match(/^(setRichness|setPct|setZone|setOreType)\(([^,)]+)/);
@@ -236,7 +235,8 @@ document.querySelectorAll('[data-onclick]').forEach(b=>{
  });
 });
 $('custom-richness').oninput=guard(async()=>{const value=Number($('custom-richness').value);if($('custom-richness').value!==''&&Number.isFinite(value)&&value>=0){searchFilter.richness=value;updateFilterButtons();renderSearch(true);await savePreferences();}});
-$('search-origin').onchange=guard(async()=>{renderSearch(true);await savePreferences();});$('radius').onchange=guard(savePreferences);
+$('search-origin').onchange=guard(async()=>{if(currentlyMinedView){currentMiningData=null;void loadCurrentlyMinedBelts(false);}else renderSearch(true);await savePreferences();});$('radius').onchange=guard(savePreferences);
+$('currently-mined-show').onclick=guard(()=>setCurrentlyMinedView(true));$('currently-mined-hide').onclick=guard(()=>setCurrentlyMinedView(false));syncCurrentlyMinedButtons();
 $('scan').onclick=guard(async()=>{
  if(scanStarting||scanState?.running)return;
  const radius=Number($('radius').value);
@@ -257,5 +257,6 @@ chrome.storage.onChanged.addListener(()=>refresh().catch(()=>{}));
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)refresh().catch(e=>{$('error').textContent=e.message;});});
 window.addEventListener('resize',()=>{if(currentContext)renderSearch();});
 window.addEventListener('pagehide',pulseCapture);
-async function tick(){try{const now=Date.now();if(now-lastCapturePulse>=2500){lastCapturePulse=now;void pulseCapture();}if(scanState?.running)await refresh();if(analysis&&lastCalendarStamp!==calendarStamp(period))renderAnalytics();}catch(e){$('error').textContent=e.message;}finally{setTimeout(tick,500);}}
+setInterval(updateLiveMiningCountdowns,1000);
+async function tick(){try{const now=Date.now();if(now-lastCapturePulse>=2500){lastCapturePulse=now;void pulseCapture();}if(scanState?.running)await refresh();if(analysis&&lastCalendarStamp!==calendarStamp(period)){await loadAnalyticsPeriod(period);renderAnalytics();}}catch(e){$('error').textContent=e.message;}finally{setTimeout(tick,500);}}
 guard(refresh)();tick();

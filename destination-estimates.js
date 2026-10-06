@@ -5,6 +5,7 @@ export const EXCAVATOR_FLEET_YIELD_BONUS=1.20;
 export const DEAD_SPACE_SPEED_MULTIPLIER=.25;
 export const MAX_MINING_CYCLES=10000;
 export const RESOURCE_TYPES=['ore','gas','plasma','ice'];
+export const SORT_MODES=new Set(['balanced','yield','fuel','fastest','net_hydrogen']);
 export const BREAKDOWN_CAPABLE_MINERS=new Set(['miner','ice_drill']);
 export const MIN_BREAKDOWN_RUNS=5;
 export const BASELINE_BREAKDOWN_RATES=Object.freeze({
@@ -92,7 +93,7 @@ export function estimateBelt(belt,distance,resource,fleet,miners,definitions,sec
 
 const metrics=item=>{
  const values=[item.expected_yield,item.mission_seconds,item.full_fleet_fuel];if(!values.every(value=>number(value)!==null)||item.expected_yield<=0||item.mission_seconds<=0||item.full_fleet_fuel<0)return null;
- const rate=item.expected_yield/item.mission_seconds*3600,cost=item.full_fleet_fuel/item.expected_yield;return Number.isFinite(rate)&&Number.isFinite(cost)?[rate,cost]:null;
+ const rate=number(item.yield_rate_override)??item.expected_yield/item.mission_seconds*3600,cost=number(item.fuel_per_resource_override)??item.full_fleet_fuel/item.expected_yield;return rate>0&&cost>=0&&Number.isFinite(rate)&&Number.isFinite(cost)?[rate,cost]:null;
 };
 const dominates=(left,right)=>left[0]>=right[0]&&left[1]<=right[1]&&(left[0]>right[0]||left[1]<right[1]);
 export function orderDestinations(destinations,{resource,enabled=false}={}){
@@ -107,14 +108,62 @@ export function orderDestinations(destinations,{resource,enabled=false}={}){
  const unknown=values.map((value,index)=>value?null:index).filter(index=>index!==null).sort((a,b)=>items[a].distance-items[b].distance||a-b);result.push(...unknown.map(index=>({destination:items[index],layer:null})));return result;
 }
 
-export function optimizeDestinations(systems,resource,counts,snapshot,breakdownRates={}){
+export function orderDestinationsByMode(destinations,{resource,mode='balanced'}={}){
+ const items=[...destinations];
+ if(!SORT_MODES.has(mode))throw Error('Unknown destination sorting mode.');
+ if(!resource||items.some(item=>item.resource!==resource))throw Error('Destination optimization requires a single resource.');
+ if(mode==='net_hydrogen'&&resource!=='gas')throw Error('Net hydrogen sorting requires Gas Cloud.');
+ if(mode==='balanced')return orderDestinations(items,{resource,enabled:true});
+ if(items.some(item=>number(item.distance)===null||item.distance<0))throw Error('Destination distance must be finite and non-negative.');
+ if(new Set(items.map(item=>item.key)).size!==items.length)throw Error('Destination keys must be unique.');
+ const supported=[],unknown=[];
+ items.forEach((item,index)=>{
+  const value=metrics(item);if(!value){unknown.push({item,index});return;}
+  const [rate,cost]=value;let key;
+  if(mode==='yield')key=[-rate,item.distance,index];
+  else if(mode==='fuel')key=[cost,item.distance,index];
+  else if(mode==='fastest'){
+   const completion=number(item.completion_seconds_override)??number(item.mission_seconds);if(completion===null||completion<=0){unknown.push({item,index});return;}key=[completion,item.distance,index];
+  }else{
+   const net=number(item.net_hydrogen_rate_override)??((item.expected_yield-item.full_fleet_fuel)/item.mission_seconds*3600);if(!Number.isFinite(net)){unknown.push({item,index});return;}key=[-net,item.distance,index];
+  }
+  supported.push({item,key});
+ });
+ const compare=(left,right)=>{for(let i=0;i<left.length;i++){const delta=left[i]-right[i];if(delta)return delta;}return 0;};
+ supported.sort((a,b)=>compare(a.key,b.key));unknown.sort((a,b)=>a.item.distance-b.item.distance||a.index-b.index);
+ return [...supported.map(row=>({destination:row.item,layer:0})),...unknown.map(row=>({destination:row.item,layer:null}))];
+}
+
+export function optimizeDestinations(systems,resource,counts,snapshot,breakdownRates={},mode='balanced'){
  if(!RESOURCE_TYPES.includes(resource))throw Error('Select one resource to use optimized sorting.');
+ if(!SORT_MODES.has(mode))throw Error('Unknown destination sorting mode.');
  if(!snapshot||!Array.isArray(snapshot.ships))return {systems:[...systems],optimization:{active:false,message:'Current ship data is unavailable.'}};
  const definitions=snapshot.ships,{fleet,miners}=selectedFleet(counts,definitions,resource);
  for(const key of BREAKDOWN_CAPABLE_MINERS)if(Object.hasOwn(fleet,key)&&number(breakdownRates[key])===null)throw Error('Mining breakdown analytics are unavailable.');
- const output=systems.map(system=>({...system,belts:(system.belts||[]).map(belt=>({...belt}))})),destinations=[];
- for(const system of output)for(const belt of system.belts){const key=String(belt.id??belt.field_id),estimate=estimateBelt(belt,system.distance,resource,fleet,miners,definitions,system.securityZone??system.security_zone,breakdownRates);belt.estimate=estimate;destinations.push({key,resource,distance:system.distance,expected_yield:estimate?.expected_yield,mission_seconds:estimate?.mission_seconds,full_fleet_fuel:estimate?.full_fleet_fuel});}
- const ranked=orderDestinations(destinations,{resource,enabled:true}),positions=new Map(ranked.map((row,index)=>[row.destination.key,index])),supported=ranked.filter(row=>row.layer!==null).length;
- if(supported){for(const system of output){system.belts.sort((a,b)=>positions.get(String(a.id??a.field_id))-positions.get(String(b.id??b.field_id)));system.optimizationRank=Math.min(...system.belts.map(belt=>positions.get(String(belt.id??belt.field_id))));}output.sort((a,b)=>a.optimizationRank-b.optimizationRank);}
- return {systems:output,optimization:{active:!!supported,supported,updated_at:snapshot.updated_at,message:supported?'Optimized for the selected fleet.':'No usable belts for this fleet.'}};
+ const output=systems.map(system=>({...system,belts:(system.belts||[]).map(belt=>({...belt}))})),systemDestinations=[];let supported=0;
+ for(const system of output){
+  const beltDestinations=[];
+  for(const belt of system.belts){const key=String(belt.id??belt.field_id),estimate=estimateBelt(belt,system.distance,resource,fleet,miners,definitions,system.securityZone??system.security_zone,breakdownRates);belt.estimate=estimate;beltDestinations.push({key,resource,distance:system.distance,expected_yield:estimate?.expected_yield,mission_seconds:estimate?.mission_seconds,full_fleet_fuel:estimate?.full_fleet_fuel});}
+  const rankedBelts=orderDestinationsByMode(beltDestinations,{resource,mode}),beltPositions=new Map(rankedBelts.map((row,index)=>[row.destination.key,index]));
+  system.belts.sort((a,b)=>beltPositions.get(String(a.id??a.field_id))-beltPositions.get(String(b.id??b.field_id)));
+  const estimates=system.belts.map(belt=>belt.estimate).filter(Boolean);supported+=estimates.length;
+  if(estimates.length){
+   const totalYield=estimates.reduce((sum,row)=>sum+row.expected_yield,0),totalFuel=estimates.reduce((sum,row)=>sum+row.full_fleet_fuel,0),completion=Math.max(...estimates.map(row=>row.mission_seconds));
+   const yieldRate=estimates.reduce((sum,row)=>sum+row.expected_yield/row.mission_seconds*3600,0),netRate=estimates.reduce((sum,row)=>sum+(row.expected_yield-row.full_fleet_fuel)/row.mission_seconds*3600,0);
+   systemDestinations.push({key:String(system.systemId??system.system_id??system.id),resource,distance:system.distance,expected_yield:totalYield,mission_seconds:completion,full_fleet_fuel:totalFuel,yield_rate_override:yieldRate,fuel_per_resource_override:totalFuel/totalYield,completion_seconds_override:completion,net_hydrogen_rate_override:netRate});
+  }else systemDestinations.push({key:String(system.systemId??system.system_id??system.id),resource,distance:system.distance});
+ }
+ const rankedSystems=orderDestinationsByMode(systemDestinations,{resource,mode}),systemPositions=new Map(rankedSystems.map((row,index)=>[row.destination.key,index]));
+ for(const system of output)system.optimizationRank=systemPositions.get(String(system.systemId??system.system_id??system.id));
+ output.sort((a,b)=>a.optimizationRank-b.optimizationRank);
+ return {systems:output,optimization:{active:!!supported,supported,updated_at:snapshot.updated_at,mode,message:supported?'':'No usable belts for this fleet.'}};
+}
+
+export function cyclesLeft(belt,resource,counts,snapshot,breakdownRates={}){
+ if(!RESOURCE_TYPES.includes(resource)||!snapshot||!Array.isArray(snapshot.ships))return null;
+ const definitions=snapshot.ships,{fleet,miners}=selectedFleet(counts,definitions,resource);
+ for(const key of BREAKDOWN_CAPABLE_MINERS)if(Object.hasOwn(fleet,key)&&number(breakdownRates[key])===null)return null;
+ const total=number(belt?.total??belt?.total_resources),remaining=number(belt?.remaining??belt?.remaining_pct),richness=number(belt?.richness);
+ if(total===null||remaining===null||richness===null||total<=0||remaining<=0||richness<=0)return remaining===0?0:null;
+ return miningCycles(total*Math.min(100,remaining)/100,richness,resource,fleet,miners,definitions,breakdownRates);
 }

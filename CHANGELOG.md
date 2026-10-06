@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.3 — 2026-10-06
+
+- Added the Personal app's optimizer modes and whole-system scoring.
+- Added Currently Mined with live fleet, cycle and return-time estimates.
+- Improved analytics responsiveness by calculating changed sections in durable delayed batches.
+
 ## 0.3.2 — 2026-10-02
 
 - Fixed switching between sidebar and full view so only one view remains open without interrupting an active scan.

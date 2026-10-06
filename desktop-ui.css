@@ -97,3 +97,17 @@ button,input,select{font-family:Rajdhani,sans-serif;font-weight:600}input,select
 }
 @media(min-width:980px){.side-panel .systems{grid-template-columns:repeat(3,minmax(0,1fr))}}
 @media(min-width:1320px){.side-panel .systems{grid-template-columns:repeat(4,minmax(0,1fr))}}
+
+#destination-view-controls{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;flex-wrap:wrap}
+.destination-heading{display:flex;align-items:center;gap:6px}
+#destination-help-wrap{position:relative;display:inline-flex}
+#destination-help{width:20px;height:20px;border:1px solid #475569;border-radius:999px;background:#1e293b;color:#bae6fd;font-weight:800;line-height:18px}
+#destination-help-tooltip{display:none;position:absolute;left:0;bottom:calc(100% + 8px);z-index:60;width:min(420px,calc(100vw - 32px));padding:10px;border:1px solid #475569;border-radius:8px;background:#020617;box-shadow:0 14px 35px #000c;color:#cbd5e1}
+#destination-help-wrap:hover #destination-help-tooltip,#destination-help:focus-visible+#destination-help-tooltip{display:grid;gap:7px}
+.destination-help-row{display:grid;grid-template-columns:92px 1fr;gap:8px;font-size:11px;line-height:1.35}.destination-help-row strong{color:#e0f2fe}
+#destination-sort-buttons{display:flex;flex-wrap:wrap;gap:7px}
+.destination-mode-button,.currently-mined-button{min-width:96px;padding:6px 10px;border:1px solid #334155;border-radius:6px;background:#1e293b;color:#94a3b8;font-weight:700}
+.destination-mode-button[aria-pressed=true],.currently-mined-button[aria-pressed=true]{border-color:#38bdf8;background:#075985;color:white}
+.destination-mode-button:disabled{opacity:.42;cursor:not-allowed}
+.side-panel #destination-view-controls{display:grid;grid-template-columns:1fr;gap:12px}.side-panel #destination-sort-buttons{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.side-panel .destination-mode-button{width:100%;min-width:0;padding:5px 6px;font-size:11px}.side-panel #destination-help-tooltip{position:fixed;left:8px;right:8px;bottom:auto;top:110px;width:auto}
+.live-mining-row{display:flex;width:100%;align-items:center;justify-content:space-between;gap:8px;color:#7dd3fc;font-size:11px}.live-mining-timing{display:flex;align-items:center;gap:8px;margin-left:auto}.live-mining-external{color:#fbbf24}.live-mining-cycles{color:#c4b5fd}.live-mining-eta{font-family:'JetBrains Mono',monospace;color:#67e8f9}.side-panel .live-mining-row{align-items:flex-start;flex-direction:column;gap:3px}.side-panel .live-mining-timing{width:100%;justify-content:space-between;margin-left:0}
